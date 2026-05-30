@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"fathom/internal/config"
 )
 
 func TestNetworkCollector(t *testing.T) {
@@ -33,14 +35,16 @@ func TestNetworkCollector(t *testing.T) {
 	}
 
 	t.Run("snapshot and metrics collection", func(t *testing.T) {
+		includeVirtual := true
 		c := &NetworkCollector{
 			procNetDevPath: netFile,
 			sysClassNetDir: classDir,
 			cachedMeta:     make(map[string]InterfaceMetadata),
 			prevMetrics:    make(map[string]InterfaceMetrics),
 			prevTime:       make(map[string]time.Time),
-			peakRxRate:     make(map[string]float64),
-			peakTxRate:     make(map[string]float64),
+			config: &config.NetworkConfig{
+				IncludeVirtual: &includeVirtual,
+			},
 		}
 
 		events, err := c.Collect(context.Background())

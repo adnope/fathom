@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"fathom/internal/config"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,4 +63,35 @@ proc /proc proc rw,relatime 0 0
 			}
 		}
 	})
+}
+
+func TestDiskCollector_Collect(t *testing.T) {
+	tests := []struct {
+		name string // description of this test case
+		// Named input parameters for receiver constructor.
+		cfg     *config.DiskConfig
+		want    []Event
+		wantErr bool
+	}{
+		// TODO: Add test cases.
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewDiskCollector(tt.cfg)
+			got, gotErr := c.Collect(context.Background())
+			if gotErr != nil {
+				if !tt.wantErr {
+					t.Errorf("Collect() failed: %v", gotErr)
+				}
+				return
+			}
+			if tt.wantErr {
+				t.Fatal("Collect() succeeded unexpectedly")
+			}
+			// TODO: update the condition below to compare got with tt.want.
+			if true {
+				t.Errorf("Collect() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

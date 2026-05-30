@@ -16,7 +16,8 @@ func GetHostMetadata() Event {
 		"kernel":             "unknown",
 		"arch":               runtime.GOARCH,
 		"cpu_count_logical":  runtime.NumCPU(),
-		"cpu_count_physical": 1,
+		"cpu_count_physical": runtime.NumCPU(),
+		"cpu_count_sockets":  1,
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -35,9 +36,9 @@ func GetHostMetadata() Event {
 		data["arch"] = arch
 	}
 
-	if physicalCPUs := getPhysicalCPUCount(); physicalCPUs > 0 {
-		data["cpu_count_physical"] = physicalCPUs
-	}
+	sockets, physicalCores := getCPUTopology()
+	data["cpu_count_sockets"] = sockets
+	data["cpu_count_physical"] = physicalCores
 
 	return Event{
 		Event:     "host_metadata",
@@ -62,7 +63,6 @@ func getOSRelease() string {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		// Fallback gracefully on scanner error
 		return "linux"
 	}
 	return "linux"
@@ -83,30 +83,67 @@ func getArch() string {
 	return string(buf)
 }
 
-func getPhysicalCPUCount() int {
+func getCPUTopology() (sockets, physicalCores int) {
 	file, err := os.Open("/proc/cpuinfo")
 	if err != nil {
-		return 1
+		return 1, runtime.NumCPU()
 	}
 	defer file.Close()
 
-	physicalIDs := make(map[string]bool)
+	socketsMap := make(map[string]bool)
+	coresMap := make(map[string]bool)
+
+	var currentPhysID string
+	var currentCoreID string
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "physical id") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				physicalIDs[strings.TrimSpace(parts[1])] = true
+		if strings.TrimSpace(line) == "" {
+			if currentPhysID != "" {
+				socketsMap[currentPhysID] = true
+				if currentCoreID != "" {
+					coresMap[currentPhysID+":"+currentCoreID] = true
+				}
 			}
+			currentPhysID = ""
+			currentCoreID = ""
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+
+		switch key {
+		case "physical id":
+			currentPhysID = val
+		case "core id":
+			currentCoreID = val
 		}
 	}
+	if currentPhysID != "" {
+		socketsMap[currentPhysID] = true
+		if currentCoreID != "" {
+			coresMap[currentPhysID+":"+currentCoreID] = true
+		}
+	}
+
 	if err := scanner.Err(); err != nil {
-		// Graceful fallback to 1 physical CPU if scanning fails
-		return 1
+		// Fallback gracefully on scanner error
 	}
-	if len(physicalIDs) > 0 {
-		return len(physicalIDs)
+
+	sockets = len(socketsMap)
+	physicalCores = len(coresMap)
+
+	if sockets == 0 {
+		sockets = 1
 	}
-	return 1
+	if physicalCores == 0 {
+		physicalCores = runtime.NumCPU()
+	}
+	return sockets, physicalCores
 }

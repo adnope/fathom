@@ -58,11 +58,14 @@ func main() {
 	)
 
 	// Initialize system metrics/metadata collectors
+	diskCol := collector.NewDiskCollector(&cfg.Disk)
+	netCol := collector.NewNetworkCollector(&cfg.Network)
+
 	collectors := []collector.Collector{
 		collector.NewCPUCollector(),
 		collector.NewMemoryCollector(),
-		collector.NewDiskCollector(),
-		collector.NewNetworkCollector(),
+		diskCol,
+		netCol,
 	}
 
 	// Channel to communicate collection interval updates on reload
@@ -88,6 +91,8 @@ func main() {
 				cfgMu.Unlock()
 
 				logger.SetLevel(newCfg.Agent.LogLevel)
+				diskCol.UpdateConfig(&newCfg.Disk)
+				netCol.UpdateConfig(&newCfg.Network)
 				l.Info("config_reload_success",
 					slog.String("component", "agent"),
 					slog.String("version", newCfg.Agent.Version),

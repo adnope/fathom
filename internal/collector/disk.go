@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
+
+	"fathom/internal/config"
 )
 
 // MountInfo captures metadata about a partition mount point.
@@ -25,13 +29,15 @@ type DiskCollector struct {
 	mountsPath   string
 	cachedMounts map[string]MountInfo
 	hasSnapshot  bool
+	config       *config.DiskConfig
 }
 
 // NewDiskCollector constructs a DiskCollector monitoring /proc/mounts.
-func NewDiskCollector() *DiskCollector {
+func NewDiskCollector(cfg *config.DiskConfig) *DiskCollector {
 	return &DiskCollector{
 		mountsPath:   "/proc/mounts",
 		cachedMounts: make(map[string]MountInfo),
+		config:       cfg,
 	}
 }
 
@@ -40,18 +46,11 @@ func (c *DiskCollector) Name() string {
 	return "disk"
 }
 
-var whitelistedFS = map[string]bool{
-	"ext2":    true,
-	"ext3":    true,
-	"ext4":    true,
-	"xfs":     true,
-	"btrfs":   true,
-	"vfat":    true,
-	"exfat":   true,
-	"ntfs":    true,
-	"fuseblk": true,
-	"zfs":     true,
-	"tmpfs":   true,
+// UpdateConfig updates the active disk filtering configuration block dynamically.
+func (c *DiskCollector) UpdateConfig(cfg *config.DiskConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.config = cfg
 }
 
 // Collect returns mount metadata snapshots, change events, and dynamic storage metric events.
@@ -67,50 +66,69 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 	var events []Event
 
 	if !c.hasSnapshot {
-		var mountsList []interface{}
+		var mountsList []any
 		for _, m := range currentMounts {
-			mountsList = append(mountsList, map[string]interface{}{
+			mountsList = append(mountsList, map[string]any{
 				"mount":           m.Mount,
 				"device":          m.Device,
 				"filesystem_type": m.FilesystemType,
 				"readonly":        m.Readonly,
 			})
 		}
+		// Sort alphabetically by mount path
+		sort.Slice(mountsList, func(i, j int) bool {
+			return mountsList[i].(map[string]any)["mount"].(string) < mountsList[j].(map[string]any)["mount"].(string)
+		})
+
 		events = append(events, Event{
 			Event:     "disk_metadata_snapshot",
 			Collector: "disk",
-			Data: map[string]interface{}{
+			Component: "collector",
+			Data: map[string]any{
 				"mounts": mountsList,
 			},
 		})
 		c.cachedMounts = currentMounts
 		c.hasSnapshot = true
 	} else {
-		// Detect changes
-		for mPath, oldM := range c.cachedMounts {
+		// Detect changes (sorted alphabetically for stable logs order)
+		var removedKeys []string
+		for mPath := range c.cachedMounts {
 			if _, exists := currentMounts[mPath]; !exists {
-				events = append(events, Event{
-					Event:     "disk_metadata_changed",
-					Collector: "disk",
-					Component: "collector",
-					Data: map[string]interface{}{
-						"mount":          mPath,
-						"old":            oldM,
-						"new":            nil,
-						"changed_fields": []string{"mount_removed"},
-					},
-				})
+				removedKeys = append(removedKeys, mPath)
 			}
 		}
+		sort.Strings(removedKeys)
 
-		for mPath, newM := range currentMounts {
+		for _, mPath := range removedKeys {
+			events = append(events, Event{
+				Event:     "disk_metadata_changed",
+				Collector: "disk",
+				Component: "collector",
+				Data: map[string]any{
+					"mount":          mPath,
+					"old":            c.cachedMounts[mPath],
+					"new":            nil,
+					"changed_fields": []string{"mount_removed"},
+				},
+			})
+		}
+
+		var addedOrModifiedKeys []string
+		for mPath := range currentMounts {
+			addedOrModifiedKeys = append(addedOrModifiedKeys, mPath)
+		}
+		sort.Strings(addedOrModifiedKeys)
+
+		for _, mPath := range addedOrModifiedKeys {
+			newM := currentMounts[mPath]
 			oldM, exists := c.cachedMounts[mPath]
 			if !exists {
 				events = append(events, Event{
 					Event:     "disk_metadata_changed",
 					Collector: "disk",
 					Component: "collector",
-					Data: map[string]interface{}{
+					Data: map[string]any{
 						"mount":          mPath,
 						"old":            nil,
 						"new":            newM,
@@ -130,7 +148,7 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 						Event:     "disk_metadata_changed",
 						Collector: "disk",
 						Component: "collector",
-						Data: map[string]interface{}{
+						Data: map[string]any{
 							"mount":          mPath,
 							"old":            oldM,
 							"new":            newM,
@@ -144,11 +162,17 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 		c.cachedMounts = currentMounts
 	}
 
-	// Gather metrics for active mounts
+	// Gather metrics for active mounts in alphabetical order
+	var sortedMounts []string
 	for mPath := range currentMounts {
+		sortedMounts = append(sortedMounts, mPath)
+	}
+	sort.Strings(sortedMounts)
+
+	for _, mPath := range sortedMounts {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(mPath, &stat); err != nil {
-			continue // Skip mounts with errors (e.g. permission or unmounted during check)
+			continue // Skip mounts with errors
 		}
 
 		total := stat.Blocks * uint64(stat.Bsize)
@@ -164,23 +188,24 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 			used = total - free
 		}
 
-		usedPercent := (float64(used) / float64(total)) * 100
-		freePercent := (float64(free) / float64(total)) * 100
-		availablePercent := (float64(available) / float64(total)) * 100
+		usedPercent := round((float64(used)/float64(total))*100, 2)
+		freePercent := round((float64(free)/float64(total))*100, 2)
+		availablePercent := round((float64(available)/float64(total))*100, 2)
 
-		inodesTotal := stat.Files
-		inodesFree := stat.Ffree
-		inodesUsed := inodesTotal - inodesFree
-
-		var inodesUsedPercent float64
-		if inodesTotal > 0 {
-			inodesUsedPercent = (float64(inodesUsed) / float64(inodesTotal)) * 100
+		// Handle filesystems without inode support (like FAT/VFAT) where total files is reported as 0
+		var inodesTotal, inodesFree, inodesUsed, inodesUsedPercent any
+		if stat.Files > 0 {
+			inodesTotal = stat.Files
+			inodesFree = stat.Ffree
+			inodesUsed = stat.Files - stat.Ffree
+			inodesUsedPercent = round((float64(stat.Files-stat.Ffree)/float64(stat.Files))*100, 2)
 		}
 
 		events = append(events, Event{
 			Event:     "metric_sample",
 			Collector: "disk",
-			Data: map[string]interface{}{
+			Component: "collector",
+			Data: map[string]any{
 				"mount":                  mPath,
 				"disk_total_bytes":       total,
 				"disk_used_bytes":        used,
@@ -198,6 +223,48 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 	}
 
 	return events, nil
+}
+
+func (c *DiskCollector) shouldKeepMount(mount, fsType string) bool {
+	// 1. Check include_mounts whitelist if present
+	if c.config != nil && len(c.config.IncludeMounts) > 0 {
+		return slices.Contains(c.config.IncludeMounts, mount)
+	}
+
+	// 2. Check virtual filesystem exclusion
+	includeVirtual := false
+	if c.config != nil && c.config.IncludeVirtual != nil {
+		includeVirtual = *c.config.IncludeVirtual
+	}
+
+	if !includeVirtual {
+		excludeFS := []string{"tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2", "debugfs", "tracefs", "securityfs", "pstore", "efivarfs", "overlay", "squashfs", "autofs", "mqueue", "hugetlbfs", "fusectl"}
+		if c.config != nil && len(c.config.ExcludeFilesystems) > 0 {
+			excludeFS = c.config.ExcludeFilesystems
+		}
+		if slices.Contains(excludeFS, fsType) {
+			return false
+		}
+	} else {
+		// Keep core virtual filesystems out of metrics to prevent loops/errors
+		if fsType == "proc" || fsType == "sysfs" {
+			return false
+		}
+	}
+
+	// 3. Check exclude_mount_prefixes
+	excludePrefixes := []string{"/run", "/dev", "/proc", "/sys"}
+	if c.config != nil && len(c.config.ExcludeMountPrefixes) > 0 {
+		excludePrefixes = c.config.ExcludeMountPrefixes
+	}
+
+	for _, prefix := range excludePrefixes {
+		if strings.HasPrefix(mount, prefix) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (c *DiskCollector) parseMounts() (map[string]MountInfo, error) {
@@ -220,7 +287,7 @@ func (c *DiskCollector) parseMounts() (map[string]MountInfo, error) {
 		fsType := fields[2]
 		opts := fields[3]
 
-		if !whitelistedFS[fsType] {
+		if !c.shouldKeepMount(mount, fsType) {
 			continue
 		}
 
@@ -235,12 +302,15 @@ func (c *DiskCollector) parseMounts() (map[string]MountInfo, error) {
 			Readonly:       isReadonly(opts),
 		}
 	}
-	return mounts, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return mounts, nil
 }
 
 func isReadonly(opts string) bool {
-	parts := strings.Split(opts, ",")
-	for _, opt := range parts {
+	parts := strings.SplitSeq(opts, ",")
+	for opt := range parts {
 		if opt == "ro" {
 			return true
 		}

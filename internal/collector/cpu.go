@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +33,14 @@ func (s cpuRawState) idleTime() uint64 {
 	return s.idle + s.iowait
 }
 
-// CPUCollector monitors detailed CPU performance, load, frequencies, temperature, and power.
+// PerCPUCore represents usage and frequency details of a single logical CPU.
+type PerCPUCore struct {
+	CPU          string   `json:"cpu"`
+	UsagePercent float64  `json:"usage_percent"`
+	FrequencyMHz *float64 `json:"frequency_mhz,omitempty"`
+}
+
+// CPUCollector monitors CPU usage, core frequencies, load averages, temperature, and power.
 type CPUCollector struct {
 	mu              sync.Mutex
 	procStatPath    string
@@ -106,12 +114,12 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	var stealPercent float64
 
 	if deltaTotal > 0 {
-		usagePercent = (float64(deltaActive) / float64(deltaTotal)) * 100
-		userPercent = (float64((globalCur.user-globalPrev.user)+(globalCur.nice-globalPrev.nice)) / float64(deltaTotal)) * 100
-		sysPercent = (float64((globalCur.system-globalPrev.system)+(globalCur.irq-globalPrev.irq)+(globalCur.softirq-globalPrev.softirq)) / float64(deltaTotal)) * 100
-		idlePercent = (float64(globalCur.idle-globalPrev.idle) / float64(deltaTotal)) * 100
-		iowaitPercent = (float64(globalCur.iowait-globalPrev.iowait) / float64(deltaTotal)) * 100
-		stealPercent = (float64(globalCur.steal-globalPrev.steal) / float64(deltaTotal)) * 100
+		usagePercent = round((float64(deltaActive)/float64(deltaTotal))*100, 2)
+		userPercent = round((float64((globalCur.user-globalPrev.user)+(globalCur.nice-globalPrev.nice))/float64(deltaTotal))*100, 2)
+		sysPercent = round((float64((globalCur.system-globalPrev.system)+(globalCur.irq-globalPrev.irq)+(globalCur.softirq-globalPrev.softirq))/float64(deltaTotal))*100, 2)
+		idlePercent = round((float64(globalCur.idle-globalPrev.idle)/float64(deltaTotal))*100, 2)
+		iowaitPercent = round((float64(globalCur.iowait-globalPrev.iowait)/float64(deltaTotal))*100, 2)
+		stealPercent = round((float64(globalCur.steal-globalPrev.steal)/float64(deltaTotal))*100, 2)
 	}
 
 	l1, l5, l15, _ := getLoadAverages(c.loadavgPath)
@@ -131,7 +139,9 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	}
 	var freqAvg float64
 	if len(freqs) > 0 {
-		freqAvg = freqSum / float64(len(freqs))
+		freqAvg = round(freqSum/float64(len(freqs)), 2)
+		freqMin = round(freqMin, 2)
+		freqMax = round(freqMax, 2)
 	} else {
 		freqMin = 0.0
 	}
@@ -139,7 +149,7 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	tempAvg, tempMax, tempOk := getCPUTemperatures()
 	power := c.getPowerWatts()
 
-	var perCPUMetrics []any
+	var perCPUMetrics []PerCPUCore
 	for name, cur := range currentStates {
 		if name == "cpu" {
 			continue
@@ -152,20 +162,33 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		dIdleTime := cur.idleTime() - prev.idleTime()
 		var cpuUsage float64
 		if dTotal > 0 {
-			cpuUsage = (float64(dTotal-dIdleTime) / float64(dTotal)) * 100
+			cpuUsage = round((float64(dTotal-dIdleTime)/float64(dTotal))*100, 2)
 		}
 
-		cpuInfo := map[string]any{
-			"cpu":           name,
-			"usage_percent": cpuUsage,
+		cpuInfo := PerCPUCore{
+			CPU:          name,
+			UsagePercent: cpuUsage,
 		}
 		if freq, found := freqs[name]; found {
-			cpuInfo["frequency_mhz"] = freq
+			fVal := round(freq, 2)
+			cpuInfo.FrequencyMHz = &fVal
 		}
 		perCPUMetrics = append(perCPUMetrics, cpuInfo)
 	}
 
+	// Sort per_cpu array by trailing logical core number (e.g. cpu0, cpu1...)
+	sort.Slice(perCPUMetrics, func(i, j int) bool {
+		idxI, _ := strconv.Atoi(strings.TrimPrefix(perCPUMetrics[i].CPU, "cpu"))
+		idxJ, _ := strconv.Atoi(strings.TrimPrefix(perCPUMetrics[j].CPU, "cpu"))
+		return idxI < idxJ
+	})
+
 	c.prevStates = currentStates
+
+	numCPUs := float64(len(perCPUMetrics))
+	if numCPUs == 0 {
+		numCPUs = 1
+	}
 
 	data := map[string]any{
 		"usage_percent":    usagePercent,
@@ -174,10 +197,14 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		"idle_percent":     idlePercent,
 		"iowait_percent":   iowaitPercent,
 		"steal_percent":    stealPercent,
-		"load_average_1m":  l1,
-		"load_average_5m":  l5,
-		"load_average_15m": l15,
-		"per_cpu":          perCPUMetrics,
+		"load_average_1m":  round(l1, 2),
+		"load_average_5m":  round(l5, 2),
+		"load_average_15m": round(l15, 2),
+		// Normalized load averages (divided by logical CPU core count)
+		"normalized_load_1m":  round(l1/numCPUs, 2),
+		"normalized_load_5m":  round(l5/numCPUs, 2),
+		"normalized_load_15m": round(l15/numCPUs, 2),
+		"per_cpu":             perCPUMetrics,
 	}
 
 	if len(freqs) > 0 {
@@ -186,17 +213,18 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		data["frequency_mhz_max"] = freqMax
 	}
 	if tempOk {
-		data["temperature_celsius_avg"] = tempAvg
-		data["temperature_celsius_max"] = tempMax
+		data["temperature_celsius_avg"] = round(tempAvg, 1)
+		data["temperature_celsius_max"] = round(tempMax, 1)
 	}
 	if power > 0 {
-		data["power_watts"] = power
+		data["power_watts"] = round(power, 2)
 	}
 
 	return []Event{
 		{
 			Event:     "metric_sample",
 			Collector: "cpu",
+			Component: "collector",
 			Data:      data,
 		},
 	}, nil

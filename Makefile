@@ -5,10 +5,10 @@ BINARY_NAME=fathom
 all: build
 
 build:
-	go build -o $(BINARY_NAME) cmd/fathom/main.go
+	go build -o bin/$(BINARY_NAME) cmd/fathom/main.go
 
 run: build
-	./$(BINARY_NAME) --config configs/config.yaml
+	./bin/$(BINARY_NAME) --config configs/config.yaml
 
 test:
 	go test -v ./...
@@ -17,4 +17,4 @@ fmt:
 	go fmt ./...
 
 clean:
-	rm -f $(BINARY_NAME)
+	rm -f bin/$(BINARY_NAME)

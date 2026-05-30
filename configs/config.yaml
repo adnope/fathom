@@ -1,4 +1,40 @@
 agent:
   version: "0.1.0"
   log_level: "info"
-  collect_interval: "3s"
+  collect_interval: "2s"
+
+disk:
+  include_virtual: false
+  exclude_filesystems:
+    - tmpfs
+    - devtmpfs
+    - proc
+    - sysfs
+    - cgroup
+    - cgroup2
+    - debugfs
+    - tracefs
+    - securityfs
+    - pstore
+    - efivarfs
+    - overlay
+    - squashfs
+    - autofs
+    - mqueue
+    - hugetlbfs
+    - fusectl
+  exclude_mount_prefixes:
+    - /run
+    - /dev
+    - /proc
+    - /sys
+
+network:
+  include_loopback: false
+  include_virtual: false
+  include_down: false
+  exclude_prefixes:
+    - veth
+    - br-
+    - docker
+    - virbr

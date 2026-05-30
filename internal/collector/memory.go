@@ -95,17 +95,17 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		used = total - available
 	}
 
-	usedPercent := (float64(used) / float64(total)) * 100
-	availablePercent := (float64(available) / float64(total)) * 100
-	freePercent := (float64(free) / float64(total)) * 100
-	cachedPercent := (float64(cached) / float64(total)) * 100
+	usedPercent := round((float64(used)/float64(total))*100, 2)
+	availablePercent := round((float64(available)/float64(total))*100, 2)
+	freePercent := round((float64(free)/float64(total))*100, 2)
+	cachedPercent := round((float64(cached)/float64(total))*100, 2)
 
 	swapUsed := swapTotal - swapFree
 	var swapUsedPercent float64
 	var swapFreePercent float64
 	if swapTotal > 0 {
-		swapUsedPercent = (float64(swapUsed) / float64(swapTotal)) * 100
-		swapFreePercent = (float64(swapFree) / float64(swapTotal)) * 100
+		swapUsedPercent = round((float64(swapUsed)/float64(swapTotal))*100, 2)
+		swapFreePercent = round((float64(swapFree)/float64(swapTotal))*100, 2)
 	}
 
 	data := map[string]any{
@@ -115,10 +115,10 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		"memory_free_bytes":        free,
 		"memory_cached_bytes":      cached,
 		"memory_buffers_bytes":     buffers,
-		"memory_used_mib":          float64(used) / (1024 * 1024),
-		"memory_used_gib":          float64(used) / (1024 * 1024 * 1024),
-		"memory_available_mib":     float64(available) / (1024 * 1024),
-		"memory_available_gib":     float64(available) / (1024 * 1024 * 1024),
+		"memory_used_mib":          round(float64(used)/(1024*1024), 2),
+		"memory_used_gib":          round(float64(used)/(1024*1024*1024), 2),
+		"memory_available_mib":     round(float64(available)/(1024*1024), 2),
+		"memory_available_gib":     round(float64(available)/(1024*1024*1024), 2),
 		"memory_used_percent":      usedPercent,
 		"memory_available_percent": availablePercent,
 		"memory_free_percent":      freePercent,
@@ -126,8 +126,8 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		"swap_total_bytes":         swapTotal,
 		"swap_used_bytes":          swapUsed,
 		"swap_free_bytes":          swapFree,
-		"swap_used_mib":            float64(swapUsed) / (1024 * 1024),
-		"swap_free_mib":            float64(swapFree) / (1024 * 1024),
+		"swap_used_mib":            round(float64(swapUsed)/(1024*1024), 2),
+		"swap_free_mib":            round(float64(swapFree)/(1024*1024), 2),
 		"swap_used_percent":        swapUsedPercent,
 		"swap_free_percent":        swapFreePercent,
 	}
@@ -136,6 +136,7 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		{
 			Event:     "metric_sample",
 			Collector: "memory",
+			Component: "collector",
 			Data:      data,
 		},
 	}, nil

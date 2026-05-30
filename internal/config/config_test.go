@@ -23,6 +23,12 @@ agent:
   version: "0.1.0"
   log_level: "info"
   collect_interval: "10s"
+disk:
+  include_virtual: false
+  exclude_filesystems:
+    - tmpfs
+  exclude_mount_prefixes:
+    - /run
 `
 		tmpFile := writeTempFile(t, content)
 		cfg, err := Load(tmpFile)
@@ -37,6 +43,12 @@ agent:
 		}
 		if cfg.Agent.CollectInterval != "10s" {
 			t.Errorf("expected collect_interval 10s, got %s", cfg.Agent.CollectInterval)
+		}
+		if len(cfg.Disk.ExcludeFilesystems) != 1 || cfg.Disk.ExcludeFilesystems[0] != "tmpfs" {
+			t.Errorf("expected disk exclude_filesystems [tmpfs], got %v", cfg.Disk.ExcludeFilesystems)
+		}
+		if len(cfg.Disk.ExcludeMountPrefixes) != 1 || cfg.Disk.ExcludeMountPrefixes[0] != "/run" {
+			t.Errorf("expected disk exclude_mount_prefixes [/run], got %v", cfg.Disk.ExcludeMountPrefixes)
 		}
 	})
 
