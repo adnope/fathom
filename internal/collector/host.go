@@ -2,8 +2,10 @@ package collector
 
 import (
 	"bufio"
+	"log/slog"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -11,13 +13,14 @@ import (
 // GetHostMetadata retrieves static details about the Linux system.
 func GetHostMetadata() Event {
 	data := map[string]any{
-		"os":                 "linux",
-		"hostname":           "unknown",
-		"kernel":             "unknown",
-		"arch":               runtime.GOARCH,
-		"cpu_count_logical":  runtime.NumCPU(),
-		"cpu_count_physical": runtime.NumCPU(),
-		"cpu_count_sockets":  1,
+		"os":                            "linux",
+		"hostname":                      "unknown",
+		"kernel":                        "unknown",
+		"arch":                          runtime.GOARCH,
+		"cpu_count_logical":             runtime.NumCPU(),
+		"cpu_count_physical":            runtime.NumCPU(),
+		"cpu_count_sockets":             1,
+		"system_boot_time_unix_seconds": getBootTime(),
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -146,4 +149,28 @@ func getCPUTopology() (sockets, physicalCores int) {
 		physicalCores = runtime.NumCPU()
 	}
 	return sockets, physicalCores
+}
+
+func getBootTime() uint64 {
+	file, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "btime ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if val, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					return val
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Error("failed to scan /proc/stat for boot time", slog.String("error", err.Error()))
+	}
+	return 0
 }

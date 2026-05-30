@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"slices"
@@ -172,6 +173,12 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 	for _, mPath := range sortedMounts {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(mPath, &stat); err != nil {
+			slog.Debug("failed to query space statistics for mount",
+				slog.String("component", "collector"),
+				slog.String("collector", "disk"),
+				slog.String("mount", mPath),
+				slog.String("error", err.Error()),
+			)
 			continue // Skip mounts with errors
 		}
 
@@ -226,12 +233,10 @@ func (c *DiskCollector) Collect(ctx context.Context) ([]Event, error) {
 }
 
 func (c *DiskCollector) shouldKeepMount(mount, fsType string) bool {
-	// 1. Check include_mounts whitelist if present
 	if c.config != nil && len(c.config.IncludeMounts) > 0 {
 		return slices.Contains(c.config.IncludeMounts, mount)
 	}
 
-	// 2. Check virtual filesystem exclusion
 	includeVirtual := false
 	if c.config != nil && c.config.IncludeVirtual != nil {
 		includeVirtual = *c.config.IncludeVirtual
@@ -246,13 +251,11 @@ func (c *DiskCollector) shouldKeepMount(mount, fsType string) bool {
 			return false
 		}
 	} else {
-		// Keep core virtual filesystems out of metrics to prevent loops/errors
 		if fsType == "proc" || fsType == "sysfs" {
 			return false
 		}
 	}
 
-	// 3. Check exclude_mount_prefixes
 	excludePrefixes := []string{"/run", "/dev", "/proc", "/sys"}
 	if c.config != nil && len(c.config.ExcludeMountPrefixes) > 0 {
 		excludePrefixes = c.config.ExcludeMountPrefixes

@@ -66,6 +66,8 @@ func main() {
 		collector.NewMemoryCollector(),
 		diskCol,
 		netCol,
+		collector.NewSystemCollector(),
+		collector.NewDiskIOCollector(),
 	}
 
 	// Channel to communicate collection interval updates on reload

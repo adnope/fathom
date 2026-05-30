@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"fathom/internal/config"
 )
@@ -32,13 +35,15 @@ type rawNetDev struct {
 
 // InterfaceMetadata represents semi-dynamic properties of a network interface.
 type InterfaceMetadata struct {
-	Interface string  `json:"interface"`
-	IPv4      *string `json:"ipv4"`
-	IPv6      *string `json:"ipv6"`
-	Operstate string  `json:"operstate"`
-	Carrier   int     `json:"carrier"`
-	MTUBytes  int     `json:"mtu_bytes"`
-	SpeedMbps *int    `json:"speed_mbps"`
+	Interface  string  `json:"interface"`
+	IPv4       *string `json:"ipv4"`
+	IPv6       *string `json:"ipv6"`
+	Operstate  string  `json:"operstate"`
+	Carrier    *int    `json:"carrier"`
+	MTUBytes   int     `json:"mtu_bytes"`
+	SpeedMbps  *int    `json:"speed_mbps"`
+	TxQueueLen *int    `json:"tx_queue_len"`
+	Duplex     *string `json:"duplex"`
 }
 
 // InterfaceMetrics caches previous values for rate calculation.
@@ -63,6 +68,7 @@ type NetworkCollector struct {
 	prevTime       map[string]time.Time
 	hasSnapshot    bool
 	config         *config.NetworkConfig
+	warnedIPs      map[string]bool
 }
 
 // NewNetworkCollector constructs a NetworkCollector with default paths.
@@ -74,6 +80,7 @@ func NewNetworkCollector(cfg *config.NetworkConfig) *NetworkCollector {
 		prevMetrics:    make(map[string]InterfaceMetrics),
 		prevTime:       make(map[string]time.Time),
 		config:         cfg,
+		warnedIPs:      make(map[string]bool),
 	}
 }
 
@@ -102,7 +109,6 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 	var events []Event
 	now := time.Now()
 
-	// 1. Gather current metadata for matching interfaces
 	currentMeta := make(map[string]InterfaceMetadata)
 	var sortedIfaces []string
 
@@ -116,8 +122,11 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 			continue
 		}
 
-		ipv4, ipv6 := getIPs(iface)
-		carrier, _ := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "carrier"))
+		ipv4, ipv6 := c.getIPsWithFallbacks(iface)
+		var carrierPtr *int
+		if carrier, err := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "carrier")); err == nil {
+			carrierPtr = &carrier
+		}
 
 		mtu := 1500
 		if sysIface, err := net.InterfaceByName(iface); err == nil {
@@ -129,20 +138,31 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 			speedPtr = &speed
 		}
 
+		var txQueueLenPtr *int
+		if txql, err := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "tx_queue_len")); err == nil {
+			txQueueLenPtr = &txql
+		}
+
+		var duplexPtr *string
+		if duplex, err := readSysFileString(filepath.Join(c.sysClassNetDir, iface, "duplex")); err == nil && duplex != "" {
+			duplexPtr = &duplex
+		}
+
 		currentMeta[iface] = InterfaceMetadata{
-			Interface: iface,
-			IPv4:      ipv4,
-			IPv6:      ipv6,
-			Operstate: operstate,
-			Carrier:   carrier,
-			MTUBytes:  mtu,
-			SpeedMbps: speedPtr,
+			Interface:  iface,
+			IPv4:       ipv4,
+			IPv6:       ipv6,
+			Operstate:  operstate,
+			Carrier:    carrierPtr,
+			MTUBytes:   mtu,
+			SpeedMbps:  speedPtr,
+			TxQueueLen: txQueueLenPtr,
+			Duplex:     duplexPtr,
 		}
 		sortedIfaces = append(sortedIfaces, iface)
 	}
 	sort.Strings(sortedIfaces)
 
-	// 2. Emit Snapshot or Change notifications
 	if !c.hasSnapshot {
 		var interfacesList []any
 		for _, iface := range sortedIfaces {
@@ -159,7 +179,6 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 		c.cachedMeta = currentMeta
 		c.hasSnapshot = true
 	} else {
-		// Detect removals (sorted alphabetically)
 		var removedKeys []string
 		for iface := range c.cachedMeta {
 			if _, exists := currentMeta[iface]; !exists {
@@ -182,7 +201,6 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 			})
 		}
 
-		// Detect additions and modifications
 		for _, iface := range sortedIfaces {
 			newM := currentMeta[iface]
 			oldM, exists := c.cachedMeta[iface]
@@ -218,6 +236,12 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 				if !equalIntPtr(oldM.SpeedMbps, newM.SpeedMbps) {
 					changed = append(changed, "speed_mbps")
 				}
+				if !equalIntPtr(oldM.TxQueueLen, newM.TxQueueLen) {
+					changed = append(changed, "tx_queue_len")
+				}
+				if !equalStringPtr(oldM.Duplex, newM.Duplex) {
+					changed = append(changed, "duplex")
+				}
 
 				if len(changed) > 0 {
 					events = append(events, Event{
@@ -237,10 +261,10 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 		c.cachedMeta = currentMeta
 	}
 
-	// 3. Collect Traffic metrics for matching interfaces
 	for _, iface := range sortedIfaces {
 		stats := netDevStats[iface]
 		var rxRate, txRate, rxPktRate, txPktRate float64
+		var rxErrRate, txErrRate, rxDropRate, txDropRate float64
 
 		prev, ok := c.prevMetrics[iface]
 		prevT, okT := c.prevTime[iface]
@@ -259,6 +283,18 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 				}
 				if stats.txPackets >= prev.txPackets {
 					txPktRate = float64(stats.txPackets-prev.txPackets) / duration
+				}
+				if stats.rxErrors >= prev.rxErrors {
+					rxErrRate = float64(stats.rxErrors-prev.rxErrors) / duration
+				}
+				if stats.txErrors >= prev.txErrors {
+					txErrRate = float64(stats.txErrors-prev.txErrors) / duration
+				}
+				if stats.rxDropped >= prev.rxDropped {
+					rxDropRate = float64(stats.rxDropped-prev.rxDropped) / duration
+				}
+				if stats.txDropped >= prev.txDropped {
+					txDropRate = float64(stats.txDropped-prev.txDropped) / duration
 				}
 			}
 		}
@@ -293,8 +329,10 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 				"tx_bytes_per_second":   round(txRate, 2),
 				"rx_packets_per_second": round(rxPktRate, 2),
 				"tx_packets_per_second": round(txPktRate, 2),
-				"rx_bits_per_second":    round(rxRate*8, 2),
-				"tx_bits_per_second":    round(txRate*8, 2),
+				"rx_errors_per_second":  round(rxErrRate, 2),
+				"tx_errors_per_second":  round(txErrRate, 2),
+				"rx_dropped_per_second": round(rxDropRate, 2),
+				"tx_dropped_per_second": round(txDropRate, 2),
 			},
 		})
 	}
@@ -303,12 +341,10 @@ func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 }
 
 func (c *NetworkCollector) shouldKeepInterface(iface, operstate string) bool {
-	// 1. Check include_interfaces whitelist
 	if c.config != nil && len(c.config.IncludeInterfaces) > 0 {
 		return slices.Contains(c.config.IncludeInterfaces, iface)
 	}
 
-	// 2. Check loopback
 	includeLoopback := false
 	if c.config != nil && c.config.IncludeLoopback != nil {
 		includeLoopback = *c.config.IncludeLoopback
@@ -317,7 +353,6 @@ func (c *NetworkCollector) shouldKeepInterface(iface, operstate string) bool {
 		return false
 	}
 
-	// 3. Check down status
 	includeDown := false
 	if c.config != nil && c.config.IncludeDown != nil {
 		includeDown = *c.config.IncludeDown
@@ -326,7 +361,6 @@ func (c *NetworkCollector) shouldKeepInterface(iface, operstate string) bool {
 		return false
 	}
 
-	// 4. Check virtual interfaces
 	includeVirtual := false
 	if c.config != nil && c.config.IncludeVirtual != nil {
 		includeVirtual = *c.config.IncludeVirtual
@@ -335,7 +369,6 @@ func (c *NetworkCollector) shouldKeepInterface(iface, operstate string) bool {
 		return false
 	}
 
-	// 5. Check exclude_prefixes
 	excludePrefixes := []string{"veth", "br-", "docker", "virbr"}
 	if c.config != nil && len(c.config.ExcludePrefixes) > 0 {
 		excludePrefixes = c.config.ExcludePrefixes
@@ -409,14 +442,14 @@ func parseProcNetDev(path string) (map[string]rawNetDev, error) {
 	return res, nil
 }
 
-func getIPs(ifaceName string) (ipv4, ipv6 *string) {
+func getIPs(ifaceName string) (ipv4, ipv6 *string, err error) {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		return nil, nil
+		return nil, nil, err
 	}
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, nil
+		return nil, nil, err
 	}
 	for _, addr := range addrs {
 		ipNet, ok := addr.(*net.IPNet)
@@ -432,7 +465,7 @@ func getIPs(ifaceName string) (ipv4, ipv6 *string) {
 			ipv6 = &s
 		}
 	}
-	return ipv4, ipv6
+	return ipv4, ipv6, nil
 }
 
 func readSysFileInt(path string) (int, error) {
@@ -473,4 +506,161 @@ func equalIntPtr(a, b *int) bool {
 		return false
 	}
 	return *a == *b
+}
+
+func (c *NetworkCollector) getIPsWithFallbacks(ifaceName string) (ipv4, ipv6 *string) {
+	var errs []string
+
+	// Method 1: standard net.InterfaceByName
+	ip4, ip6, err := getIPs(ifaceName)
+	if err == nil {
+		return ip4, ip6
+	}
+	errs = append(errs, fmt.Sprintf("net.InterfaceByName: %v", err))
+
+	// Method 2: standard net.Interfaces list search
+	ip4, ip6, err = getIPsFallbackList(ifaceName)
+	if err == nil {
+		return ip4, ip6
+	}
+	errs = append(errs, fmt.Sprintf("net.Interfaces list: %v", err))
+
+	// Method 3: Low-level /proc and ioctl fallbacks
+	var fallbackIPv4, fallbackIPv6 *string
+
+	// Try ioctl for IPv4
+	ip4Str, err := getIPv4ViaIoctl(ifaceName)
+	if err == nil {
+		fallbackIPv4 = &ip4Str
+	} else {
+		errs = append(errs, fmt.Sprintf("ioctl SIOCGIFADDR: %v", err))
+	}
+
+	// Try procfs for IPv6
+	ip6Str, err := getIPv6FromProc(ifaceName)
+	if err == nil {
+		fallbackIPv6 = &ip6Str
+	} else {
+		errs = append(errs, fmt.Sprintf("procfs if_inet6: %v", err))
+	}
+
+	if fallbackIPv4 != nil || fallbackIPv6 != nil {
+		return fallbackIPv4, fallbackIPv6
+	}
+
+	if c.warnedIPs == nil {
+		c.warnedIPs = make(map[string]bool)
+	}
+	alreadyWarned := c.warnedIPs[ifaceName]
+	c.warnedIPs[ifaceName] = true
+
+	if !alreadyWarned {
+		slog.Warn("failed to retrieve IP addresses for interface",
+			slog.String("component", "collector"),
+			slog.String("collector", "network"),
+			slog.String("interface", ifaceName),
+			slog.String("errors", strings.Join(errs, "; ")),
+		)
+	}
+
+	return nil, nil
+}
+
+func getIPsFallbackList(ifaceName string) (ipv4, ipv6 *string, err error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, iface := range ifaces {
+		if iface.Name == ifaceName {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, addr := range addrs {
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ip := ipNet.IP
+				if ip4 := ip.To4(); ip4 != nil {
+					s := ip4.String()
+					ipv4 = &s
+				} else if ip16 := ip.To16(); ip16 != nil {
+					s := ip16.String()
+					ipv6 = &s
+				}
+			}
+			return ipv4, ipv6, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("interface %s not found in net.Interfaces()", ifaceName)
+}
+
+func getIPv4ViaIoctl(ifaceName string) (string, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_IP)
+	if err != nil {
+		return "", err
+	}
+	defer syscall.Close(fd)
+
+	var ifr [40]byte
+	copy(ifr[:15], ifaceName)
+
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(syscall.SIOCGIFADDR),
+		uintptr(unsafe.Pointer(&ifr[0])),
+	)
+	if errno != 0 {
+		return "", errno
+	}
+
+	ip := net.IPv4(ifr[20], ifr[21], ifr[22], ifr[23])
+	return ip.String(), nil
+}
+
+func getIPv6FromProc(ifaceName string) (string, error) {
+	file, err := os.Open("/proc/net/if_inet6")
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+
+		if fields[5] != ifaceName {
+			continue
+		}
+
+		hexIP := fields[0]
+		if len(hexIP) != 32 {
+			continue
+		}
+
+		ipBytes := make([]byte, 16)
+		for i := range 16 {
+			b, err := strconv.ParseUint(hexIP[i*2:i*2+2], 16, 8)
+			if err != nil {
+				return "", err
+			}
+			ipBytes[i] = byte(b)
+		}
+
+		ip := net.IP(ipBytes)
+		return ip.String(), nil
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to scan /proc/net/if_inet6: %w", err)
+	}
+
+	return "", fmt.Errorf("interface %s not found in /proc/net/if_inet6", ifaceName)
 }

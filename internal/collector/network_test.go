@@ -88,3 +88,33 @@ func TestNetworkCollector(t *testing.T) {
 		}
 	})
 }
+
+func TestIPLookupFallbacks(t *testing.T) {
+	// Test getIPv4ViaIoctl on the standard loopback interface
+	ip4, err := getIPv4ViaIoctl("lo")
+	if err != nil {
+		t.Logf("getIPv4ViaIoctl failed (normal if not supported on this platform/kernel): %v", err)
+	} else if ip4 != "127.0.0.1" {
+		t.Errorf("expected 127.0.0.1 for loopback, got %s", ip4)
+	}
+
+	// Test getIPv6FromProc on the standard loopback interface
+	ip6, err := getIPv6FromProc("lo")
+	if err != nil {
+		t.Logf("getIPv6FromProc failed: %v", err)
+	} else if ip6 != "::1" && ip6 != "0:0:0:0:0:0:0:1" && ip6 != "::" {
+		t.Errorf("expected ::1 for loopback, got %s", ip6)
+	}
+
+	// Test getIPsFallbackList
+	ip4Fallback, ip6Fallback, err := getIPsFallbackList("lo")
+	if err != nil {
+		t.Fatalf("getIPsFallbackList failed for loopback: %v", err)
+	}
+	if ip4Fallback == nil || *ip4Fallback != "127.0.0.1" {
+		t.Errorf("expected 127.0.0.1 for loopback fallback list, got %v", ip4Fallback)
+	}
+	if ip6Fallback == nil || (*ip6Fallback != "::1" && *ip6Fallback != "0:0:0:0:0:0:0:1") {
+		t.Logf("loopback fallback list IPv6: %v (can be nil if IPv6 is disabled for loopback)", ip6Fallback)
+	}
+}

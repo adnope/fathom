@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -45,11 +46,13 @@ type CPUCollector struct {
 	mu              sync.Mutex
 	procStatPath    string
 	loadavgPath     string
-	powercapPath    string
 	prevStates      map[string]cpuRawState
 	prevPowerEnergy uint64
 	prevPowerTime   time.Time
 	hasPrev         bool
+	warnedRAPL      bool
+	warnedTemp      bool
+	warnedFreq      bool
 }
 
 // NewCPUCollector constructs a CPUCollector with default paths.
@@ -57,7 +60,6 @@ func NewCPUCollector() *CPUCollector {
 	return &CPUCollector{
 		procStatPath: "/proc/stat",
 		loadavgPath:  "/proc/loadavg",
-		powercapPath: "/sys/class/powercap/intel-rapl:0/energy_uj",
 		prevStates:   make(map[string]cpuRawState),
 	}
 }
@@ -123,7 +125,7 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	}
 
 	l1, l5, l15, _ := getLoadAverages(c.loadavgPath)
-	freqs := getCPUFrequencies()
+	freqs := c.getCPUFrequencies()
 
 	var freqSum float64
 	freqMin := math.MaxFloat64
@@ -146,7 +148,7 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		freqMin = 0.0
 	}
 
-	tempAvg, tempMax, tempOk := getCPUTemperatures()
+	tempAvg, tempMax, tempOk := c.getCPUTemperatures()
 	power := c.getPowerWatts()
 
 	var perCPUMetrics []PerCPUCore
@@ -176,7 +178,6 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		perCPUMetrics = append(perCPUMetrics, cpuInfo)
 	}
 
-	// Sort per_cpu array by trailing logical core number (e.g. cpu0, cpu1...)
 	sort.Slice(perCPUMetrics, func(i, j int) bool {
 		idxI, _ := strconv.Atoi(strings.TrimPrefix(perCPUMetrics[i].CPU, "cpu"))
 		idxJ, _ := strconv.Atoi(strings.TrimPrefix(perCPUMetrics[j].CPU, "cpu"))
@@ -191,16 +192,15 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	}
 
 	data := map[string]any{
-		"usage_percent":    usagePercent,
-		"user_percent":     userPercent,
-		"system_percent":   sysPercent,
-		"idle_percent":     idlePercent,
-		"iowait_percent":   iowaitPercent,
-		"steal_percent":    stealPercent,
-		"load_average_1m":  round(l1, 2),
-		"load_average_5m":  round(l5, 2),
-		"load_average_15m": round(l15, 2),
-		// Normalized load averages (divided by logical CPU core count)
+		"usage_percent":       usagePercent,
+		"user_percent":        userPercent,
+		"system_percent":      sysPercent,
+		"idle_percent":        idlePercent,
+		"iowait_percent":      iowaitPercent,
+		"steal_percent":       stealPercent,
+		"load_average_1m":     round(l1, 2),
+		"load_average_5m":     round(l5, 2),
+		"load_average_15m":    round(l15, 2),
 		"normalized_load_1m":  round(l1/numCPUs, 2),
 		"normalized_load_5m":  round(l5/numCPUs, 2),
 		"normalized_load_15m": round(l15/numCPUs, 2),
@@ -275,22 +275,60 @@ func parseProcStat(path string) (map[string]cpuRawState, error) {
 	return states, scanner.Err()
 }
 
-func getCPUFrequencies() map[string]float64 {
+func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 	freqs := make(map[string]float64)
-	matches, err := filepath.Glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")
+
+	matches, err := filepath.Glob("/sys/devices/system/cpu/cpu[0-9]*")
 	if err == nil && len(matches) > 0 {
 		for _, m := range matches {
-			parts := strings.Split(m, "/")
-			if len(parts) >= 6 {
-				cpuName := parts[5]
-				if data, err := os.ReadFile(m); err == nil {
-					if val, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil {
+			cpuName := filepath.Base(m)
+			paths := []string{
+				filepath.Join(m, "cpufreq/scaling_cur_freq"),
+				filepath.Join(m, "cpufreq/cpuinfo_cur_freq"),
+				filepath.Join(m, "cpufreq/scaling_max_freq"),
+			}
+			for _, p := range paths {
+				if data, err := os.ReadFile(p); err == nil {
+					if val, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil && val > 0 {
 						freqs[cpuName] = val / 1000.0
+						break
 					}
 				}
 			}
 		}
 	}
+
+	if len(freqs) == 0 {
+		policies, err := filepath.Glob("/sys/devices/system/cpu/cpufreq/policy*")
+		if err == nil && len(policies) > 0 {
+			for _, p := range policies {
+				affectedData, err := os.ReadFile(filepath.Join(p, "affected_cpus"))
+				if err == nil {
+					cpus := strings.Fields(string(affectedData))
+					var freqVal float64
+					paths := []string{
+						filepath.Join(p, "scaling_cur_freq"),
+						filepath.Join(p, "cpuinfo_cur_freq"),
+						filepath.Join(p, "scaling_max_freq"),
+					}
+					for _, fPath := range paths {
+						if data, err := os.ReadFile(fPath); err == nil {
+							if val, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64); err == nil && val > 0 {
+								freqVal = val / 1000.0
+								break
+							}
+						}
+					}
+					if freqVal > 0 {
+						for _, cpuIdx := range cpus {
+							freqs["cpu"+cpuIdx] = freqVal
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if len(freqs) == 0 {
 		if file, err := os.Open("/proc/cpuinfo"); err == nil {
 			defer file.Close()
@@ -301,35 +339,45 @@ func getCPUFrequencies() map[string]float64 {
 				if strings.HasPrefix(line, "cpu MHz") {
 					parts := strings.SplitN(line, ":", 2)
 					if len(parts) == 2 {
-						if mhz, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil {
+						if mhz, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil && mhz > 0 {
 							freqs[fmt.Sprintf("cpu%d", cpuIdx)] = mhz
 							cpuIdx++
 						}
 					}
 				}
 			}
-			if err := scanner.Err(); err != nil {
-				// Handle or ignore scanner error
-			}
+			_ = scanner.Err()
 		}
 	}
+
+	if len(freqs) == 0 {
+		if !c.warnedFreq {
+			slog.Warn("unable to read CPU frequency metrics",
+				slog.String("component", "collector"),
+				slog.String("collector", "cpu"),
+			)
+			c.warnedFreq = true
+		}
+	}
+
 	return freqs
 }
 
-func getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
+func (c *CPUCollector) getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 	var temps []float64
+
 	matches, err := filepath.Glob("/sys/class/hwmon/hwmon*/name")
 	if err == nil && len(matches) > 0 {
 		for _, m := range matches {
 			if nameData, err := os.ReadFile(m); err == nil {
 				name := strings.TrimSpace(string(nameData))
-				if name == "coretemp" || name == "k10temp" || name == "acpitz" {
-					dir := filepath.Dir(m)
-					inputs, err := filepath.Glob(filepath.Join(dir, "temp*_input"))
-					if err == nil {
-						for _, input := range inputs {
+				dir := filepath.Dir(m)
+				inputs, err := filepath.Glob(filepath.Join(dir, "temp*_input"))
+				if err == nil {
+					for _, input := range inputs {
+						if c.isCPUTempSensor(input, name) {
 							if tempData, err := os.ReadFile(input); err == nil {
-								if millideg, err := strconv.ParseFloat(strings.TrimSpace(string(tempData)), 64); err == nil {
+								if millideg, err := strconv.ParseFloat(strings.TrimSpace(string(tempData)), 64); err == nil && millideg > 0 {
 									temps = append(temps, millideg/1000.0)
 								}
 							}
@@ -339,21 +387,47 @@ func getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 			}
 		}
 	}
+
 	if len(temps) == 0 {
 		matches, err := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
 		if err == nil {
 			for _, m := range matches {
-				if tempData, err := os.ReadFile(m); err == nil {
-					if millideg, err := strconv.ParseFloat(strings.TrimSpace(string(tempData)), 64); err == nil {
-						temps = append(temps, millideg/1000.0)
+				dir := filepath.Dir(m)
+				typePath := filepath.Join(dir, "type")
+				useZone := true
+				if typeData, err := os.ReadFile(typePath); err == nil {
+					zoneType := strings.ToLower(strings.TrimSpace(string(typeData)))
+					if !strings.Contains(zoneType, "cpu") &&
+						!strings.Contains(zoneType, "package") &&
+						!strings.Contains(zoneType, "core") &&
+						!strings.Contains(zoneType, "acpitz") &&
+						!strings.Contains(zoneType, "soc") &&
+						!strings.Contains(zoneType, "x86_pkg") {
+						useZone = false
+					}
+				}
+				if useZone {
+					if tempData, err := os.ReadFile(m); err == nil {
+						if millideg, err := strconv.ParseFloat(strings.TrimSpace(string(tempData)), 64); err == nil && millideg > 0 {
+							temps = append(temps, millideg/1000.0)
+						}
 					}
 				}
 			}
 		}
 	}
+
 	if len(temps) == 0 {
+		if !c.warnedTemp {
+			slog.Warn("no compatible hardware temperature sensors found",
+				slog.String("component", "collector"),
+				slog.String("collector", "cpu"),
+			)
+			c.warnedTemp = true
+		}
 		return 0.0, 0.0, false
 	}
+
 	var sum float64
 	maxVal = -1000.0
 	for _, t := range temps {
@@ -363,6 +437,31 @@ func getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 		}
 	}
 	return sum / float64(len(temps)), maxVal, true
+}
+
+func (c *CPUCollector) isCPUTempSensor(inputPath string, name string) bool {
+	nameLower := strings.ToLower(name)
+	if nameLower == "coretemp" || nameLower == "k10temp" || nameLower == "acpitz" ||
+		nameLower == "zenpower" || nameLower == "fam15h_power" || nameLower == "amd_energy" ||
+		nameLower == "cpu_thermal" || nameLower == "soc_thermal" {
+		return true
+	}
+
+	dir := filepath.Dir(inputPath)
+	base := filepath.Base(inputPath)
+	if strings.HasPrefix(base, "temp") && strings.HasSuffix(base, "_input") {
+		sensorNum := strings.TrimSuffix(strings.TrimPrefix(base, "temp"), "_input")
+		labelPath := filepath.Join(dir, "temp"+sensorNum+"_label")
+		if labelData, err := os.ReadFile(labelPath); err == nil {
+			label := strings.ToLower(strings.TrimSpace(string(labelData)))
+			if strings.Contains(label, "core") || strings.Contains(label, "package") ||
+				strings.Contains(label, "cpu") || strings.Contains(label, "tdie") ||
+				strings.Contains(label, "tctl") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func getLoadAverages(path string) (l1, l5, l15 float64, err error) {
@@ -390,30 +489,76 @@ func getLoadAverages(path string) (l1, l5, l15 float64, err error) {
 }
 
 func (c *CPUCollector) getPowerWatts() float64 {
-	data, err := os.ReadFile(c.powercapPath)
-	if err != nil {
-		return 0.0
-	}
-	uj, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-	if err != nil {
-		return 0.0
+	raplPaths, _ := filepath.Glob("/sys/class/powercap/intel-rapl:[0-9]*/energy_uj")
+	var totalEnergy uint64
+	for _, p := range raplPaths {
+		if data, err := os.ReadFile(p); err == nil {
+			if val, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				totalEnergy += val
+			}
+		}
 	}
 
-	now := time.Now()
-	if c.prevPowerEnergy == 0 {
-		c.prevPowerEnergy = uj
+	if totalEnergy > 0 {
+		now := time.Now()
+		if c.prevPowerEnergy == 0 {
+			c.prevPowerEnergy = totalEnergy
+			c.prevPowerTime = now
+			return 0.0
+		}
+
+		deltaEnergy := totalEnergy - c.prevPowerEnergy
+		deltaTime := now.Sub(c.prevPowerTime)
+
+		c.prevPowerEnergy = totalEnergy
 		c.prevPowerTime = now
+
+		if deltaTime.Seconds() > 0 {
+			return float64(deltaEnergy) / 1000000.0 / deltaTime.Seconds()
+		}
 		return 0.0
 	}
 
-	deltaEnergy := uj - c.prevPowerEnergy
-	deltaTime := now.Sub(c.prevPowerTime)
+	if hwmonPower := c.getHwmonPower(); hwmonPower > 0 {
+		return hwmonPower
+	}
 
-	c.prevPowerEnergy = uj
-	c.prevPowerTime = now
+	if !c.warnedRAPL {
+		slog.Warn("failed to retrieve CPU power metrics",
+			slog.String("component", "collector"),
+			slog.String("collector", "cpu"),
+		)
+		c.warnedRAPL = true
+	}
+	return 0.0
+}
 
-	if deltaTime.Seconds() > 0 {
-		return float64(deltaEnergy) / 1000000.0 / deltaTime.Seconds()
+func (c *CPUCollector) getHwmonPower() float64 {
+	matches, err := filepath.Glob("/sys/class/hwmon/hwmon*/name")
+	if err != nil || len(matches) == 0 {
+		return 0.0
+	}
+	for _, nameFile := range matches {
+		if nameData, err := os.ReadFile(nameFile); err == nil {
+			name := strings.TrimSpace(string(nameData))
+			if name == "amd_energy" || name == "zenpower" || name == "fam15h_power" || name == "intel_rapl" {
+				dir := filepath.Dir(nameFile)
+				powerFiles, err := filepath.Glob(filepath.Join(dir, "power*_input"))
+				if err == nil && len(powerFiles) > 0 {
+					var totalMicrowatts float64
+					for _, pFile := range powerFiles {
+						if pData, err := os.ReadFile(pFile); err == nil {
+							if uw, err := strconv.ParseFloat(strings.TrimSpace(string(pData)), 64); err == nil {
+								totalMicrowatts += uw
+							}
+						}
+					}
+					if totalMicrowatts > 0 {
+						return totalMicrowatts / 1000000.0
+					}
+				}
+			}
+		}
 	}
 	return 0.0
 }
