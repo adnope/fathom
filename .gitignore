@@ -1,0 +1,23 @@
+# Binaries
+bin/
+
+# Build and packaging output
+dist/
+*.deb
+*.rpm
+
+# Logs
+*.log
+
+# OS-specific files
+.DS_Store
+
+# IDE and Editor configurations
+.idea/
+.vscode/
+.zed/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
