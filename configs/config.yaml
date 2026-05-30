@@ -1,6 +1,6 @@
 agent:
   version: "0.1.0"
-  log_level: "info"
+  log_level: "debug"
   collect_interval: "2s"
 
 disk:

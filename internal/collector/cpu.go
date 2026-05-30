@@ -524,7 +524,7 @@ func (c *CPUCollector) getPowerWatts() float64 {
 	}
 
 	if !c.warnedRAPL {
-		slog.Warn("failed to retrieve CPU power metrics",
+		slog.Debug("failed to retrieve CPU power metrics",
 			slog.String("component", "collector"),
 			slog.String("collector", "cpu"),
 		)

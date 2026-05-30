@@ -85,6 +85,18 @@ func TestDiskIOCollector(t *testing.T) {
 	if sdaData["disk_write_bytes_per_second"] != 5120.0 {
 		t.Errorf("expected write rate 5120, got %v", sdaData["disk_write_bytes_per_second"])
 	}
+	if sdaData["disk_reads_per_second"] != 10.0 {
+		t.Errorf("expected reads per second 10.0, got %v", sdaData["disk_reads_per_second"])
+	}
+	if sdaData["disk_writes_per_second"] != 5.0 {
+		t.Errorf("expected writes per second 5.0, got %v", sdaData["disk_writes_per_second"])
+	}
+	if sdaData["disk_read_latency_seconds_avg"] != 0.01 {
+		t.Errorf("expected avg read latency 0.01s, got %v", sdaData["disk_read_latency_seconds_avg"])
+	}
+	if sdaData["disk_write_latency_seconds_avg"] != 0.01 {
+		t.Errorf("expected avg write latency 0.01s, got %v", sdaData["disk_write_latency_seconds_avg"])
+	}
 	if sdaData["disk_io_util_percent"] != 5.0 {
 		t.Errorf("expected util percent 5%%, got %v", sdaData["disk_io_util_percent"])
 	}

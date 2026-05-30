@@ -42,6 +42,11 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		cached       uint64
 		swapTotal    uint64
 		swapFree     uint64
+		dirty        uint64
+		writeback    uint64
+		slab         uint64
+		committedAs  uint64
+		commitLimit  uint64
 		hasAvailable bool
 	)
 
@@ -76,6 +81,16 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 			swapTotal = valBytes
 		case "SwapFree":
 			swapFree = valBytes
+		case "Dirty":
+			dirty = valBytes
+		case "Writeback":
+			writeback = valBytes
+		case "Slab":
+			slab = valBytes
+		case "Committed_AS":
+			committedAs = valBytes
+		case "CommitLimit":
+			commitLimit = valBytes
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -108,22 +123,33 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 		swapFreePercent = round((float64(swapFree)/float64(swapTotal))*100, 2)
 	}
 
+	var commitPercent float64
+	if commitLimit > 0 {
+		commitPercent = round((float64(committedAs)/float64(commitLimit))*100, 2)
+	}
+
 	data := map[string]any{
-		"memory_total_bytes":       total,
-		"memory_used_bytes":        used,
-		"memory_available_bytes":   available,
-		"memory_free_bytes":        free,
-		"memory_cached_bytes":      cached,
-		"memory_buffers_bytes":     buffers,
-		"memory_used_percent":      usedPercent,
-		"memory_available_percent": availablePercent,
-		"memory_free_percent":      freePercent,
-		"memory_cached_percent":    cachedPercent,
-		"swap_total_bytes":         swapTotal,
-		"swap_used_bytes":          swapUsed,
-		"swap_free_bytes":          swapFree,
-		"swap_used_percent":        swapUsedPercent,
-		"swap_free_percent":        swapFreePercent,
+		"memory_total_bytes":        total,
+		"memory_used_bytes":         used,
+		"memory_available_bytes":    available,
+		"memory_free_bytes":         free,
+		"memory_cached_bytes":       cached,
+		"memory_buffers_bytes":      buffers,
+		"memory_used_percent":       usedPercent,
+		"memory_available_percent":  availablePercent,
+		"memory_free_percent":       freePercent,
+		"memory_cached_percent":     cachedPercent,
+		"swap_total_bytes":          swapTotal,
+		"swap_used_bytes":           swapUsed,
+		"swap_free_bytes":           swapFree,
+		"swap_used_percent":         swapUsedPercent,
+		"swap_free_percent":         swapFreePercent,
+		"memory_dirty_bytes":        dirty,
+		"memory_writeback_bytes":    writeback,
+		"memory_slab_bytes":         slab,
+		"memory_committed_as_bytes": committedAs,
+		"memory_commit_limit_bytes": commitLimit,
+		"memory_commit_percent":     commitPercent,
 	}
 
 	return []Event{

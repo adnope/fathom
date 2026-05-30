@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSystemCollector(t *testing.T) {
@@ -28,9 +29,9 @@ procs_blocked 2
 		t.Fatalf("failed to write mock stat: %v", err)
 	}
 
-	// Mock file-nr
+	// Mock file-nr (allocated = 10000, unused = 0, max = 1000000, used percent = 1.0%)
 	fileNrPath := filepath.Join(tmpDir, "file-nr")
-	if err := os.WriteFile(fileNrPath, []byte("1024 0 1616788\n"), 0644); err != nil {
+	if err := os.WriteFile(fileNrPath, []byte("10000 0 1000000\n"), 0644); err != nil {
 		t.Fatalf("failed to write mock file-nr: %v", err)
 	}
 
@@ -71,13 +72,17 @@ procs_blocked 2
 	}
 
 	expectedMetrics := map[string]any{
-		"system_uptime_seconds":             12345.67,
-		"system_processes_running":          uint64(5),
-		"system_processes_blocked":          uint64(2),
-		"system_processes_total":            uint64(4567),
-		"system_context_switches_total":     uint64(9876543),
-		"system_file_descriptors_allocated": uint64(1024),
-		"system_threads_total":              uint64(3),
+		"system_uptime_seconds":                12345.67,
+		"system_processes_running":             uint64(5),
+		"system_processes_blocked":             uint64(2),
+		"system_processes_total":               uint64(4567),
+		"system_context_switches_total":        uint64(9876543),
+		"system_file_descriptors_allocated":    uint64(10000),
+		"system_file_descriptors_max":          uint64(1000000),
+		"system_file_descriptors_used_percent": 1.0,
+		"system_threads_total":                 uint64(3),
+		"system_context_switches_per_second":   0.0,
+		"system_processes_created_per_second":  0.0,
 	}
 
 	for k, expectedVal := range expectedMetrics {
@@ -89,5 +94,34 @@ procs_blocked 2
 		if gotVal != expectedVal {
 			t.Errorf("for %s: expected %v, got %v", k, expectedVal, gotVal)
 		}
+	}
+
+	// Update stats to test rate calculations
+	statContent2 := `cpu  100 200 300 400 500 600 700 0 0 0
+ctxt 9876743
+processes 4577
+procs_running 6
+procs_blocked 1
+`
+	if err := os.WriteFile(statPath, []byte(statContent2), 0644); err != nil {
+		t.Fatalf("failed to write mock stat 2: %v", err)
+	}
+
+	// Artificially adjust c.prevTime to simulate 2-second interval
+	c.prevTime = time.Now().Add(-2 * time.Second)
+
+	events, err = c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("second Collect failed: %v", err)
+	}
+
+	ev = events[0]
+	// ctxt diff: 9876743 - 9876543 = 200 ctxt / 2s = 100.0 ctxt/sec
+	// processes diff: 4577 - 4567 = 10 proc / 2s = 5.0 proc/sec
+	if ev.Data["system_context_switches_per_second"] != 100.0 {
+		t.Errorf("expected ctxt rate 100.0, got %v", ev.Data["system_context_switches_per_second"])
+	}
+	if ev.Data["system_processes_created_per_second"] != 5.0 {
+		t.Errorf("expected processes rate 5.0, got %v", ev.Data["system_processes_created_per_second"])
 	}
 }
