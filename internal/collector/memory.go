@@ -4,10 +4,27 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 )
+
+type memoryStats struct {
+	total        uint64
+	free         uint64
+	available    uint64
+	buffers      uint64
+	cached       uint64
+	swapTotal    uint64
+	swapFree     uint64
+	dirty        uint64
+	writeback    uint64
+	slab         uint64
+	committedAs  uint64
+	commitLimit  uint64
+	hasAvailable bool
+}
 
 // MemoryCollector monitors detailed memory and swap utilization.
 type MemoryCollector struct {
@@ -28,29 +45,40 @@ func (c *MemoryCollector) Name() string {
 
 // Collect reads meminfo and returns Memory and Swap stats.
 func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	file, err := os.Open(c.path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open meminfo file: %w", err)
+		return nil, fmt.Errorf("read required memory source %s: %w", c.path, err)
 	}
 	defer file.Close()
 
-	var (
-		total        uint64
-		free         uint64
-		available    uint64
-		buffers      uint64
-		cached       uint64
-		swapTotal    uint64
-		swapFree     uint64
-		dirty        uint64
-		writeback    uint64
-		slab         uint64
-		committedAs  uint64
-		commitLimit  uint64
-		hasAvailable bool
-	)
+	stats, err := parseMemInfo(file)
+	if err != nil {
+		return nil, fmt.Errorf("scan required memory source %s: %w", c.path, err)
+	}
+	if stats.total == 0 {
+		return nil, fmt.Errorf("required memory source %s missing MemTotal", c.path)
+	}
+	if !stats.hasAvailable {
+		stats.available = stats.free + stats.buffers + stats.cached
+	}
 
-	scanner := bufio.NewScanner(file)
+	return []Event{
+		{
+			Event:     eventMetricSample,
+			Collector: c.Name(),
+			Component: componentCollector,
+			Data:      buildMemoryData(stats),
+		},
+	}, nil
+}
+
+func parseMemInfo(reader io.Reader) (memoryStats, error) {
+	var stats memoryStats
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
 		fields := strings.Fields(line)
@@ -67,97 +95,86 @@ func (c *MemoryCollector) Collect(ctx context.Context) ([]Event, error) {
 
 		switch key {
 		case "MemTotal":
-			total = valBytes
+			stats.total = valBytes
 		case "MemFree":
-			free = valBytes
+			stats.free = valBytes
 		case "MemAvailable":
-			available = valBytes
-			hasAvailable = true
+			stats.available = valBytes
+			stats.hasAvailable = true
 		case "Buffers":
-			buffers = valBytes
+			stats.buffers = valBytes
 		case "Cached":
-			cached = valBytes
+			stats.cached = valBytes
 		case "SwapTotal":
-			swapTotal = valBytes
+			stats.swapTotal = valBytes
 		case "SwapFree":
-			swapFree = valBytes
+			stats.swapFree = valBytes
 		case "Dirty":
-			dirty = valBytes
+			stats.dirty = valBytes
 		case "Writeback":
-			writeback = valBytes
+			stats.writeback = valBytes
 		case "Slab":
-			slab = valBytes
+			stats.slab = valBytes
 		case "Committed_AS":
-			committedAs = valBytes
+			stats.committedAs = valBytes
 		case "CommitLimit":
-			commitLimit = valBytes
+			stats.commitLimit = valBytes
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to scan meminfo: %w", err)
+		return memoryStats{}, err
 	}
+	return stats, nil
+}
 
-	if total == 0 {
-		return nil, fmt.Errorf("missing MemTotal in meminfo")
-	}
-
-	if !hasAvailable {
-		available = free + buffers + cached
-	}
-
+func buildMemoryData(stats memoryStats) map[string]any {
 	var used uint64
-	if total > available {
-		used = total - available
+	if stats.total > stats.available {
+		used = stats.total - stats.available
 	}
 
-	usedPercent := round((float64(used)/float64(total))*100, 2)
-	availablePercent := round((float64(available)/float64(total))*100, 2)
-	freePercent := round((float64(free)/float64(total))*100, 2)
-	cachedPercent := round((float64(cached)/float64(total))*100, 2)
+	usedPercent := round((float64(used)/float64(stats.total))*100, 2)
+	availablePercent := round((float64(stats.available)/float64(stats.total))*100, 2)
+	freePercent := round((float64(stats.free)/float64(stats.total))*100, 2)
+	cachedPercent := round((float64(stats.cached)/float64(stats.total))*100, 2)
 
-	swapUsed := swapTotal - swapFree
+	var swapUsed uint64
+	if stats.swapTotal > stats.swapFree {
+		swapUsed = stats.swapTotal - stats.swapFree
+	}
 	var swapUsedPercent float64
 	var swapFreePercent float64
-	if swapTotal > 0 {
-		swapUsedPercent = round((float64(swapUsed)/float64(swapTotal))*100, 2)
-		swapFreePercent = round((float64(swapFree)/float64(swapTotal))*100, 2)
+	if stats.swapTotal > 0 {
+		swapUsedPercent = round((float64(swapUsed)/float64(stats.swapTotal))*100, 2)
+		swapFreePercent = round((float64(stats.swapFree)/float64(stats.swapTotal))*100, 2)
 	}
 
 	var commitPercent float64
-	if commitLimit > 0 {
-		commitPercent = round((float64(committedAs)/float64(commitLimit))*100, 2)
+	if stats.commitLimit > 0 {
+		commitPercent = round((float64(stats.committedAs)/float64(stats.commitLimit))*100, 2)
 	}
 
-	data := map[string]any{
-		"memory_total_bytes":        total,
+	return map[string]any{
+		"memory_total_bytes":        stats.total,
 		"memory_used_bytes":         used,
-		"memory_available_bytes":    available,
-		"memory_free_bytes":         free,
-		"memory_cached_bytes":       cached,
-		"memory_buffers_bytes":      buffers,
+		"memory_available_bytes":    stats.available,
+		"memory_free_bytes":         stats.free,
+		"memory_cached_bytes":       stats.cached,
+		"memory_buffers_bytes":      stats.buffers,
 		"memory_used_percent":       usedPercent,
 		"memory_available_percent":  availablePercent,
 		"memory_free_percent":       freePercent,
 		"memory_cached_percent":     cachedPercent,
-		"swap_total_bytes":          swapTotal,
+		"swap_total_bytes":          stats.swapTotal,
 		"swap_used_bytes":           swapUsed,
-		"swap_free_bytes":           swapFree,
+		"swap_free_bytes":           stats.swapFree,
 		"swap_used_percent":         swapUsedPercent,
 		"swap_free_percent":         swapFreePercent,
-		"memory_dirty_bytes":        dirty,
-		"memory_writeback_bytes":    writeback,
-		"memory_slab_bytes":         slab,
-		"memory_committed_as_bytes": committedAs,
-		"memory_commit_limit_bytes": commitLimit,
+		"memory_dirty_bytes":        stats.dirty,
+		"memory_writeback_bytes":    stats.writeback,
+		"memory_slab_bytes":         stats.slab,
+		"memory_committed_as_bytes": stats.committedAs,
+		"memory_commit_limit_bytes": stats.commitLimit,
 		"memory_commit_percent":     commitPercent,
 	}
-
-	return []Event{
-		{
-			Event:     "metric_sample",
-			Collector: "memory",
-			Component: "collector",
-			Data:      data,
-		},
-	}, nil
 }

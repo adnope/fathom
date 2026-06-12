@@ -2,6 +2,7 @@ package collector
 
 import (
 	"bufio"
+	"io"
 	"log/slog"
 	"os"
 	"runtime"
@@ -12,6 +13,14 @@ import (
 
 // GetHostMetadata retrieves static details about the Linux system.
 func GetHostMetadata() Event {
+	return Event{
+		Event:     "host_metadata",
+		Component: "agent",
+		Data:      buildHostMetadataData(),
+	}
+}
+
+func buildHostMetadataData() map[string]any {
 	data := map[string]any{
 		"os":                            "linux",
 		"hostname":                      "unknown",
@@ -43,11 +52,7 @@ func GetHostMetadata() Event {
 	data["cpu_count_sockets"] = sockets
 	data["cpu_count_physical"] = physicalCores
 
-	return Event{
-		Event:     "host_metadata",
-		Component: "agent",
-		Data:      data,
-	}
+	return data
 }
 
 func getOSRelease() string {
@@ -57,18 +62,24 @@ func getOSRelease() string {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	if osRelease, err := parseOSRelease(file); err == nil && osRelease != "" {
+		return osRelease
+	}
+	return "linux"
+}
+
+func parseOSRelease(reader io.Reader) (string, error) {
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if after, ok := strings.CutPrefix(line, "PRETTY_NAME="); ok {
-			val := after
-			return strings.Trim(val, `"'`)
+			return strings.Trim(after, `"'`), nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "linux"
+		return "", err
 	}
-	return "linux"
+	return "", nil
 }
 
 func getArch() string {
@@ -93,13 +104,17 @@ func getCPUTopology() (sockets, physicalCores int) {
 	}
 	defer file.Close()
 
+	return parseCPUTopology(file)
+}
+
+func parseCPUTopology(reader io.Reader) (sockets, physicalCores int) {
 	socketsMap := make(map[string]bool)
 	coresMap := make(map[string]bool)
 
 	var currentPhysID string
 	var currentCoreID string
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
@@ -157,20 +172,28 @@ func getBootTime() uint64 {
 		return 0
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	bootTime, err := parseBootTime(file)
+	if err != nil {
+		slog.Error("failed to scan /proc/stat for boot time", slog.String("error", err.Error()))
+	}
+	return bootTime
+}
+
+func parseBootTime(reader io.Reader) (uint64, error) {
+	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "btime ") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
 				if val, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-					return val
+					return val, nil
 				}
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		slog.Error("failed to scan /proc/stat for boot time", slog.String("error", err.Error()))
+		return 0, err
 	}
-	return 0
+	return 0, nil
 }

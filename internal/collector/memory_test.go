@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,4 +78,63 @@ Committed_AS:      400000 kB
 			t.Errorf("expected commit percent 50.0, got %v", ev.Data["memory_commit_percent"])
 		}
 	})
+}
+
+func TestParseMemInfo(t *testing.T) {
+	stats, err := parseMemInfo(strings.NewReader(`MemTotal: 1000 kB
+MemFree: bad kB
+MemAvailable: 700 kB
+Cached: 300 kB
+`))
+	if err != nil {
+		t.Fatalf("parseMemInfo failed: %v", err)
+	}
+
+	if stats.total != 1000*1024 {
+		t.Fatalf("expected total bytes %d, got %d", 1000*1024, stats.total)
+	}
+	if stats.free != 0 {
+		t.Fatalf("expected malformed MemFree to be ignored, got %d", stats.free)
+	}
+	if stats.available != 700*1024 || !stats.hasAvailable {
+		t.Fatalf("expected available bytes with flag, got %d flag=%v", stats.available, stats.hasAvailable)
+	}
+}
+
+func TestMemoryCollectorMemAvailableFallback(t *testing.T) {
+	memFile := filepath.Join(t.TempDir(), "meminfo")
+	content := `MemTotal:       1000 kB
+MemFree:         100 kB
+Buffers:         200 kB
+Cached:          300 kB
+`
+	if err := os.WriteFile(memFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write mock meminfo: %v", err)
+	}
+
+	c := &MemoryCollector{path: memFile}
+	events, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect failed: %v", err)
+	}
+
+	data := events[0].Data
+	if data["memory_available_bytes"] != uint64(600*1024) {
+		t.Fatalf("expected fallback available bytes %d, got %v", 600*1024, data["memory_available_bytes"])
+	}
+	if data["memory_used_percent"] != 40.0 {
+		t.Fatalf("expected used percent 40.0, got %v", data["memory_used_percent"])
+	}
+}
+
+func TestMemoryCollectorMissingMemTotal(t *testing.T) {
+	memFile := filepath.Join(t.TempDir(), "meminfo")
+	if err := os.WriteFile(memFile, []byte("MemFree: 100 kB\n"), 0644); err != nil {
+		t.Fatalf("failed to write mock meminfo: %v", err)
+	}
+
+	c := &MemoryCollector{path: memFile}
+	if _, err := c.Collect(context.Background()); err == nil {
+		t.Fatal("expected missing MemTotal error")
+	}
 }

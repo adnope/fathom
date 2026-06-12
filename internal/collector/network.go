@@ -33,9 +33,23 @@ type rawNetDev struct {
 	txDropped uint64
 }
 
+type networkRates struct {
+	rxBytesRate           float64
+	txBytesRate           float64
+	rxPacketsRate         float64
+	txPacketsRate         float64
+	rxErrorsRate          float64
+	txErrorsRate          float64
+	rxDroppedRate         float64
+	txDroppedRate         float64
+	sampleIntervalSeconds float64
+	hasSampleInterval     bool
+}
+
 // InterfaceMetadata represents semi-dynamic properties of a network interface.
 type InterfaceMetadata struct {
 	Interface  string  `json:"interface"`
+	Type       string  `json:"interface_type"`
 	IPv4       *string `json:"ipv4"`
 	IPv6       *string `json:"ipv6"`
 	Operstate  string  `json:"operstate"`
@@ -68,7 +82,7 @@ type NetworkCollector struct {
 	prevTime       map[string]time.Time
 	hasSnapshot    bool
 	config         *config.NetworkConfig
-	warnedIPs      map[string]bool
+	issues         *collectorIssueLogger
 }
 
 // NewNetworkCollector constructs a NetworkCollector with default paths.
@@ -80,7 +94,7 @@ func NewNetworkCollector(cfg *config.NetworkConfig) *NetworkCollector {
 		prevMetrics:    make(map[string]InterfaceMetrics),
 		prevTime:       make(map[string]time.Time),
 		config:         cfg,
-		warnedIPs:      make(map[string]bool),
+		issues:         newCollectorIssueLogger(),
 	}
 }
 
@@ -100,244 +114,395 @@ func (c *NetworkCollector) UpdateConfig(cfg *config.NetworkConfig) {
 func (c *NetworkCollector) Collect(ctx context.Context) ([]Event, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	netDevStats, err := parseProcNetDev(c.procNetDevPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse proc/net/dev: %w", err)
+		return nil, fmt.Errorf("read required network source %s: %w", c.procNetDevPath, err)
 	}
 
 	var events []Event
 	now := time.Now()
-
-	currentMeta := make(map[string]InterfaceMetadata)
-	var sortedIfaces []string
-
-	for iface := range netDevStats {
-		operstate, _ := readSysFileString(filepath.Join(c.sysClassNetDir, iface, "operstate"))
-		if operstate == "" {
-			operstate = "unknown"
-		}
-
-		if !c.shouldKeepInterface(iface, operstate) {
-			continue
-		}
-
-		ipv4, ipv6 := c.getIPsWithFallbacks(iface)
-		var carrierPtr *int
-		if carrier, err := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "carrier")); err == nil {
-			carrierPtr = &carrier
-		}
-
-		mtu := 1500
-		if sysIface, err := net.InterfaceByName(iface); err == nil {
-			mtu = sysIface.MTU
-		}
-
-		var speedPtr *int
-		if speed, err := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "speed")); err == nil && speed > 0 {
-			speedPtr = &speed
-		}
-
-		var txQueueLenPtr *int
-		if txql, err := readSysFileInt(filepath.Join(c.sysClassNetDir, iface, "tx_queue_len")); err == nil {
-			txQueueLenPtr = &txql
-		}
-
-		var duplexPtr *string
-		if duplex, err := readSysFileString(filepath.Join(c.sysClassNetDir, iface, "duplex")); err == nil && duplex != "" {
-			duplexPtr = &duplex
-		}
-
-		currentMeta[iface] = InterfaceMetadata{
-			Interface:  iface,
-			IPv4:       ipv4,
-			IPv6:       ipv6,
-			Operstate:  operstate,
-			Carrier:    carrierPtr,
-			MTUBytes:   mtu,
-			SpeedMbps:  speedPtr,
-			TxQueueLen: txQueueLenPtr,
-			Duplex:     duplexPtr,
-		}
-		sortedIfaces = append(sortedIfaces, iface)
-	}
-	sort.Strings(sortedIfaces)
+	currentMeta, sortedIfaces := c.collectNetworkMetadata(netDevStats)
 
 	if !c.hasSnapshot {
-		var interfacesList []any
-		for _, iface := range sortedIfaces {
-			interfacesList = append(interfacesList, currentMeta[iface])
-		}
-		events = append(events, Event{
-			Event:     "network_metadata_snapshot",
-			Collector: "network",
-			Component: "collector",
-			Data: map[string]any{
-				"interfaces": interfacesList,
-			},
-		})
+		events = append(events, buildNetworkMetadataSnapshotEvent(currentMeta, sortedIfaces))
 		c.cachedMeta = currentMeta
 		c.hasSnapshot = true
 	} else {
-		var removedKeys []string
-		for iface := range c.cachedMeta {
-			if _, exists := currentMeta[iface]; !exists {
-				removedKeys = append(removedKeys, iface)
-			}
-		}
-		sort.Strings(removedKeys)
-
-		for _, iface := range removedKeys {
-			events = append(events, Event{
-				Event:     "network_metadata_changed",
-				Collector: "network",
-				Component: "collector",
-				Data: map[string]any{
-					"interface":      iface,
-					"old":            c.cachedMeta[iface],
-					"new":            nil,
-					"changed_fields": []string{"interface_removed"},
-				},
-			})
-		}
-
-		for _, iface := range sortedIfaces {
-			newM := currentMeta[iface]
-			oldM, exists := c.cachedMeta[iface]
-			if !exists {
-				events = append(events, Event{
-					Event:     "network_metadata_changed",
-					Collector: "network",
-					Component: "collector",
-					Data: map[string]any{
-						"interface":      iface,
-						"old":            nil,
-						"new":            newM,
-						"changed_fields": []string{"interface_added"},
-					},
-				})
-			} else if !reflect.DeepEqual(oldM, newM) {
-				var changed []string
-				if !equalStringPtr(oldM.IPv4, newM.IPv4) {
-					changed = append(changed, "ipv4")
-				}
-				if !equalStringPtr(oldM.IPv6, newM.IPv6) {
-					changed = append(changed, "ipv6")
-				}
-				if oldM.Operstate != newM.Operstate {
-					changed = append(changed, "operstate")
-				}
-				if oldM.Carrier != newM.Carrier {
-					changed = append(changed, "carrier")
-				}
-				if oldM.MTUBytes != newM.MTUBytes {
-					changed = append(changed, "mtu_bytes")
-				}
-				if !equalIntPtr(oldM.SpeedMbps, newM.SpeedMbps) {
-					changed = append(changed, "speed_mbps")
-				}
-				if !equalIntPtr(oldM.TxQueueLen, newM.TxQueueLen) {
-					changed = append(changed, "tx_queue_len")
-				}
-				if !equalStringPtr(oldM.Duplex, newM.Duplex) {
-					changed = append(changed, "duplex")
-				}
-
-				if len(changed) > 0 {
-					events = append(events, Event{
-						Event:     "network_metadata_changed",
-						Collector: "network",
-						Component: "collector",
-						Data: map[string]any{
-							"interface":      iface,
-							"old":            oldM,
-							"new":            newM,
-							"changed_fields": changed,
-						},
-					})
-				}
-			}
-		}
+		events = append(events, buildNetworkMetadataChangeEvents(c.cachedMeta, currentMeta, sortedIfaces)...)
 		c.cachedMeta = currentMeta
 	}
 
 	for _, iface := range sortedIfaces {
 		stats := netDevStats[iface]
-		var rxRate, txRate, rxPktRate, txPktRate float64
-		var rxErrRate, txErrRate, rxDropRate, txDropRate float64
-
 		prev, ok := c.prevMetrics[iface]
 		prevT, okT := c.prevTime[iface]
-
-		if ok && okT {
-			duration := now.Sub(prevT).Seconds()
-			if duration > 0 {
-				if stats.rxBytes >= prev.rxBytes {
-					rxRate = float64(stats.rxBytes-prev.rxBytes) / duration
-				}
-				if stats.txBytes >= prev.txBytes {
-					txRate = float64(stats.txBytes-prev.txBytes) / duration
-				}
-				if stats.rxPackets >= prev.rxPackets {
-					rxPktRate = float64(stats.rxPackets-prev.rxPackets) / duration
-				}
-				if stats.txPackets >= prev.txPackets {
-					txPktRate = float64(stats.txPackets-prev.txPackets) / duration
-				}
-				if stats.rxErrors >= prev.rxErrors {
-					rxErrRate = float64(stats.rxErrors-prev.rxErrors) / duration
-				}
-				if stats.txErrors >= prev.txErrors {
-					txErrRate = float64(stats.txErrors-prev.txErrors) / duration
-				}
-				if stats.rxDropped >= prev.rxDropped {
-					rxDropRate = float64(stats.rxDropped-prev.rxDropped) / duration
-				}
-				if stats.txDropped >= prev.txDropped {
-					txDropRate = float64(stats.txDropped-prev.txDropped) / duration
-				}
-			}
+		if ok && networkCounterReset(stats, prev) {
+			c.issueLogger().log(slog.LevelDebug, c.Name(), actionZeroMetric, "network_rates", c.procNetDevPath, nil,
+				slog.String("resource_type", resourceTypeInterface),
+				slog.String("resource", iface),
+			)
+		} else {
+			c.issueLogger().clear(c.Name(), actionZeroMetric, "network_rates", c.procNetDevPath,
+				slog.String("resource_type", resourceTypeInterface),
+				slog.String("resource", iface),
+			)
 		}
+		rates := calculateNetworkRates(stats, prev, ok, prevT, okT, now)
 
-		c.prevMetrics[iface] = InterfaceMetrics{
-			rxBytes:   stats.rxBytes,
-			txBytes:   stats.txBytes,
-			rxPackets: stats.rxPackets,
-			txPackets: stats.txPackets,
-			rxErrors:  stats.rxErrors,
-			txErrors:  stats.txErrors,
-			rxDropped: stats.rxDropped,
-			txDropped: stats.txDropped,
-		}
+		c.prevMetrics[iface] = interfaceMetricsFromRaw(stats)
 		c.prevTime[iface] = now
+		events = append(events, buildNetworkMetricEvent(currentMeta[iface], stats, rates))
+	}
 
+	return events, nil
+}
+
+func (c *NetworkCollector) issueLogger() *collectorIssueLogger {
+	if c.issues == nil {
+		c.issues = newCollectorIssueLogger()
+	}
+	return c.issues
+}
+
+func (c *NetworkCollector) collectNetworkMetadata(netDevStats map[string]rawNetDev) (map[string]InterfaceMetadata, []string) {
+	currentMeta := make(map[string]InterfaceMetadata)
+	var sortedIfaces []string
+
+	for iface := range netDevStats {
+		metadata, ok := c.readInterfaceMetadata(iface)
+		if !ok {
+			continue
+		}
+		currentMeta[iface] = metadata
+		sortedIfaces = append(sortedIfaces, iface)
+	}
+	sort.Strings(sortedIfaces)
+
+	return currentMeta, sortedIfaces
+}
+
+func (c *NetworkCollector) readInterfaceMetadata(iface string) (InterfaceMetadata, bool) {
+	operstate, _ := readSysFileString(filepath.Join(c.sysClassNetDir, iface, "operstate"))
+	if operstate == "" {
+		operstate = "unknown"
+	}
+
+	if !c.shouldKeepInterface(iface, operstate) {
+		return InterfaceMetadata{}, false
+	}
+
+	ifaceType := c.interfaceType(iface)
+	ipv4, ipv6 := c.getIPsWithFallbacks(iface)
+	carrierPtr := c.readOptionalInterfaceInt(iface, "carrier", filepath.Join(c.sysClassNetDir, iface, "carrier"), false)
+
+	mtu := 1500
+	if sysIface, err := net.InterfaceByName(iface); err == nil {
+		mtu = sysIface.MTU
+	}
+
+	var speedPtr *int
+	var duplexPtr *string
+	if ifaceType != "wireless" {
+		speedPtr = c.readOptionalInterfaceInt(iface, "speed_mbps", filepath.Join(c.sysClassNetDir, iface, "speed"), true)
+		duplexPtr = c.readOptionalInterfaceString(iface, "duplex", filepath.Join(c.sysClassNetDir, iface, "duplex"))
+	}
+	txQueueLenPtr := c.readOptionalInterfaceInt(iface, "tx_queue_len", filepath.Join(c.sysClassNetDir, iface, "tx_queue_len"), false)
+
+	return InterfaceMetadata{
+		Interface:  iface,
+		Type:       ifaceType,
+		IPv4:       ipv4,
+		IPv6:       ipv6,
+		Operstate:  operstate,
+		Carrier:    carrierPtr,
+		MTUBytes:   mtu,
+		SpeedMbps:  speedPtr,
+		TxQueueLen: txQueueLenPtr,
+		Duplex:     duplexPtr,
+	}, true
+}
+
+func (c *NetworkCollector) readOptionalInterfaceInt(iface, metric, path string, requirePositive bool) *int {
+	value, err := readSysFileInt(path)
+	if err != nil {
+		c.logOptionalInterfaceIssue(iface, metric, path, err)
+		return nil
+	}
+	if requirePositive && value <= 0 {
+		c.logOptionalInterfaceIssue(iface, metric, path, fmt.Errorf("non-positive value %d", value))
+		return nil
+	}
+	c.clearOptionalInterfaceIssue(iface, metric, path)
+	return &value
+}
+
+func (c *NetworkCollector) readOptionalInterfaceString(iface, metric, path string) *string {
+	value, err := readSysFileString(path)
+	if err != nil {
+		c.logOptionalInterfaceIssue(iface, metric, path, err)
+		return nil
+	}
+	if value == "" {
+		c.logOptionalInterfaceIssue(iface, metric, path, fmt.Errorf("empty value"))
+		return nil
+	}
+	c.clearOptionalInterfaceIssue(iface, metric, path)
+	return &value
+}
+
+func (c *NetworkCollector) logOptionalInterfaceIssue(iface, metric, path string, err error) {
+	level := slog.LevelDebug
+	if c.isConfiguredInterface(iface) {
+		level = slog.LevelWarn
+	}
+	c.issueLogger().log(level, c.Name(), actionOmitMetric, metric, path, err,
+		slog.String("resource_type", resourceTypeInterface),
+		slog.String("resource", iface),
+	)
+}
+
+func (c *NetworkCollector) clearOptionalInterfaceIssue(iface, metric, path string) {
+	c.issueLogger().clear(c.Name(), actionOmitMetric, metric, path,
+		slog.String("resource_type", resourceTypeInterface),
+		slog.String("resource", iface),
+	)
+}
+
+func buildNetworkMetadataSnapshotEvent(currentMeta map[string]InterfaceMetadata, sortedIfaces []string) Event {
+	var interfacesList []any
+	for _, iface := range sortedIfaces {
+		interfacesList = append(interfacesList, currentMeta[iface])
+	}
+
+	return Event{
+		Event:     "network_metadata_snapshot",
+		Collector: "network",
+		Component: componentCollector,
+		Data: map[string]any{
+			"interfaces": interfacesList,
+		},
+	}
+}
+
+func buildNetworkMetadataChangeEvents(oldMeta, currentMeta map[string]InterfaceMetadata, sortedIfaces []string) []Event {
+	var events []Event
+	var removedKeys []string
+	for iface := range oldMeta {
+		if _, exists := currentMeta[iface]; !exists {
+			removedKeys = append(removedKeys, iface)
+		}
+	}
+	sort.Strings(removedKeys)
+
+	for _, iface := range removedKeys {
 		events = append(events, Event{
-			Event:     "metric_sample",
+			Event:     "network_metadata_changed",
 			Collector: "network",
-			Component: "collector",
+			Component: componentCollector,
 			Data: map[string]any{
-				"interface":             iface,
-				"rx_bytes_total":        stats.rxBytes,
-				"tx_bytes_total":        stats.txBytes,
-				"rx_packets_total":      stats.rxPackets,
-				"tx_packets_total":      stats.txPackets,
-				"rx_errors_total":       stats.rxErrors,
-				"tx_errors_total":       stats.txErrors,
-				"rx_dropped_total":      stats.rxDropped,
-				"tx_dropped_total":      stats.txDropped,
-				"rx_bytes_per_second":   round(rxRate, 2),
-				"tx_bytes_per_second":   round(txRate, 2),
-				"rx_packets_per_second": round(rxPktRate, 2),
-				"tx_packets_per_second": round(txPktRate, 2),
-				"rx_errors_per_second":  round(rxErrRate, 2),
-				"tx_errors_per_second":  round(txErrRate, 2),
-				"rx_dropped_per_second": round(rxDropRate, 2),
-				"tx_dropped_per_second": round(txDropRate, 2),
+				"interface":      iface,
+				"old":            oldMeta[iface],
+				"new":            nil,
+				"changed_fields": []string{"interface_removed"},
 			},
 		})
 	}
 
-	return events, nil
+	for _, iface := range sortedIfaces {
+		newMetadata := currentMeta[iface]
+		oldMetadata, exists := oldMeta[iface]
+		if !exists {
+			events = append(events, Event{
+				Event:     "network_metadata_changed",
+				Collector: "network",
+				Component: componentCollector,
+				Data: map[string]any{
+					"interface":      iface,
+					"old":            nil,
+					"new":            newMetadata,
+					"changed_fields": []string{"interface_added"},
+				},
+			})
+			continue
+		}
+
+		if reflect.DeepEqual(oldMetadata, newMetadata) {
+			continue
+		}
+
+		changed := changedNetworkMetadataFields(oldMetadata, newMetadata)
+		if len(changed) == 0 {
+			continue
+		}
+
+		events = append(events, Event{
+			Event:     "network_metadata_changed",
+			Collector: "network",
+			Component: componentCollector,
+			Data: map[string]any{
+				"interface":      iface,
+				"old":            oldMetadata,
+				"new":            newMetadata,
+				"changed_fields": changed,
+			},
+		})
+	}
+
+	return events
+}
+
+func changedNetworkMetadataFields(oldMetadata, newMetadata InterfaceMetadata) []string {
+	var changed []string
+	if !equalStringPtr(oldMetadata.IPv4, newMetadata.IPv4) {
+		changed = append(changed, "ipv4")
+	}
+	if !equalStringPtr(oldMetadata.IPv6, newMetadata.IPv6) {
+		changed = append(changed, "ipv6")
+	}
+	if oldMetadata.Type != newMetadata.Type {
+		changed = append(changed, "interface_type")
+	}
+	if oldMetadata.Operstate != newMetadata.Operstate {
+		changed = append(changed, "operstate")
+	}
+	if oldMetadata.Carrier != newMetadata.Carrier {
+		changed = append(changed, "carrier")
+	}
+	if oldMetadata.MTUBytes != newMetadata.MTUBytes {
+		changed = append(changed, "mtu_bytes")
+	}
+	if !equalIntPtr(oldMetadata.SpeedMbps, newMetadata.SpeedMbps) {
+		changed = append(changed, "speed_mbps")
+	}
+	if !equalIntPtr(oldMetadata.TxQueueLen, newMetadata.TxQueueLen) {
+		changed = append(changed, "tx_queue_len")
+	}
+	if !equalStringPtr(oldMetadata.Duplex, newMetadata.Duplex) {
+		changed = append(changed, "duplex")
+	}
+	return changed
+}
+
+func calculateNetworkRates(stats rawNetDev, prev InterfaceMetrics, hasPrev bool, prevTime time.Time, hasPrevTime bool, now time.Time) networkRates {
+	if !hasPrev || !hasPrevTime {
+		return networkRates{}
+	}
+
+	duration := now.Sub(prevTime).Seconds()
+	if duration <= 0 {
+		return networkRates{}
+	}
+
+	rates := networkRates{
+		sampleIntervalSeconds: duration,
+		hasSampleInterval:     true,
+	}
+	if diff, ok := counterDiff(stats.rxBytes, prev.rxBytes); ok {
+		rates.rxBytesRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.txBytes, prev.txBytes); ok {
+		rates.txBytesRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.rxPackets, prev.rxPackets); ok {
+		rates.rxPacketsRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.txPackets, prev.txPackets); ok {
+		rates.txPacketsRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.rxErrors, prev.rxErrors); ok {
+		rates.rxErrorsRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.txErrors, prev.txErrors); ok {
+		rates.txErrorsRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.rxDropped, prev.rxDropped); ok {
+		rates.rxDroppedRate = float64(diff) / duration
+	}
+	if diff, ok := counterDiff(stats.txDropped, prev.txDropped); ok {
+		rates.txDroppedRate = float64(diff) / duration
+	}
+
+	return rates
+}
+
+func interfaceMetricsFromRaw(stats rawNetDev) InterfaceMetrics {
+	return InterfaceMetrics{
+		rxBytes:   stats.rxBytes,
+		txBytes:   stats.txBytes,
+		rxPackets: stats.rxPackets,
+		txPackets: stats.txPackets,
+		rxErrors:  stats.rxErrors,
+		txErrors:  stats.txErrors,
+		rxDropped: stats.rxDropped,
+		txDropped: stats.txDropped,
+	}
+}
+
+func networkCounterReset(stats rawNetDev, prev InterfaceMetrics) bool {
+	return stats.rxBytes < prev.rxBytes ||
+		stats.txBytes < prev.txBytes ||
+		stats.rxPackets < prev.rxPackets ||
+		stats.txPackets < prev.txPackets ||
+		stats.rxErrors < prev.rxErrors ||
+		stats.txErrors < prev.txErrors ||
+		stats.rxDropped < prev.rxDropped ||
+		stats.txDropped < prev.txDropped
+}
+
+func buildNetworkMetricEvent(metadata InterfaceMetadata, stats rawNetDev, rates networkRates) Event {
+	iface := metadata.Interface
+	var carrier any
+	if metadata.Carrier != nil {
+		carrier = *metadata.Carrier
+	}
+
+	return Event{
+		Event:     eventMetricSample,
+		Collector: "network",
+		Component: componentCollector,
+		Data: map[string]any{
+			"resource_type":           resourceTypeInterface,
+			"resource_id":             resourceID(resourceTypeInterface, iface),
+			"interface":               iface,
+			"interface_type":          metadata.Type,
+			"operstate":               metadata.Operstate,
+			"carrier":                 carrier,
+			"sample_interval_seconds": optionalRoundedFloat(rates.hasSampleInterval, rates.sampleIntervalSeconds, 3),
+			"rx_bytes_total":          stats.rxBytes,
+			"tx_bytes_total":          stats.txBytes,
+			"rx_packets_total":        stats.rxPackets,
+			"tx_packets_total":        stats.txPackets,
+			"rx_errors_total":         stats.rxErrors,
+			"tx_errors_total":         stats.txErrors,
+			"rx_dropped_total":        stats.rxDropped,
+			"tx_dropped_total":        stats.txDropped,
+			"rx_bytes_per_second":     optionalRoundedFloat(rates.hasSampleInterval, rates.rxBytesRate, 2),
+			"tx_bytes_per_second":     optionalRoundedFloat(rates.hasSampleInterval, rates.txBytesRate, 2),
+			"rx_packets_per_second":   optionalRoundedFloat(rates.hasSampleInterval, rates.rxPacketsRate, 2),
+			"tx_packets_per_second":   optionalRoundedFloat(rates.hasSampleInterval, rates.txPacketsRate, 2),
+			"rx_errors_per_second":    optionalRoundedFloat(rates.hasSampleInterval, rates.rxErrorsRate, 2),
+			"tx_errors_per_second":    optionalRoundedFloat(rates.hasSampleInterval, rates.txErrorsRate, 2),
+			"rx_dropped_per_second":   optionalRoundedFloat(rates.hasSampleInterval, rates.rxDroppedRate, 2),
+			"tx_dropped_per_second":   optionalRoundedFloat(rates.hasSampleInterval, rates.txDroppedRate, 2),
+		},
+	}
+}
+
+func (c *NetworkCollector) interfaceType(iface string) string {
+	if iface == "lo" {
+		return "loopback"
+	}
+	if _, err := os.Stat(filepath.Join(c.sysClassNetDir, iface, "wireless")); err == nil {
+		return "wireless"
+	}
+	if isVirtualInterface(c.sysClassNetDir, iface) {
+		return "virtual"
+	}
+	return "ethernet"
 }
 
 func (c *NetworkCollector) shouldKeepInterface(iface, operstate string) bool {
@@ -397,49 +562,87 @@ func parseProcNetDev(path string) (map[string]rawNetDev, error) {
 	res := make(map[string]rawNetDev)
 	scanner := bufio.NewScanner(file)
 	lineCount := 0
+	sawInterfaceLine := false
 	for scanner.Scan() {
 		lineCount++
 		if lineCount <= 2 {
 			continue
 		}
-		line := scanner.Text()
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) < 2 {
+		if strings.Contains(scanner.Text(), ":") {
+			sawInterfaceLine = true
+		}
+		stat, ok := parseProcNetDevLine(scanner.Text())
+		if !ok {
 			continue
 		}
-		iface := strings.TrimSpace(parts[0])
-
-		fields := strings.Fields(parts[1])
-		if len(fields) < 16 {
-			continue
-		}
-
-		rxB, _ := strconv.ParseUint(fields[0], 10, 64)
-		rxP, _ := strconv.ParseUint(fields[1], 10, 64)
-		rxE, _ := strconv.ParseUint(fields[2], 10, 64)
-		rxD, _ := strconv.ParseUint(fields[3], 10, 64)
-
-		txB, _ := strconv.ParseUint(fields[8], 10, 64)
-		txP, _ := strconv.ParseUint(fields[9], 10, 64)
-		txE, _ := strconv.ParseUint(fields[10], 10, 64)
-		txD, _ := strconv.ParseUint(fields[11], 10, 64)
-
-		res[iface] = rawNetDev{
-			iface:     iface,
-			rxBytes:   rxB,
-			rxPackets: rxP,
-			rxErrors:  rxE,
-			rxDropped: rxD,
-			txBytes:   txB,
-			txPackets: txP,
-			txErrors:  txE,
-			txDropped: txD,
-		}
+		res[stat.iface] = stat
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
+	if sawInterfaceLine && len(res) == 0 {
+		return nil, fmt.Errorf("no usable network interface lines")
+	}
 	return res, nil
+}
+
+func parseProcNetDevLine(line string) (rawNetDev, bool) {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) < 2 {
+		return rawNetDev{}, false
+	}
+	iface := strings.TrimSpace(parts[0])
+
+	fields := strings.Fields(parts[1])
+	if len(fields) < 16 {
+		return rawNetDev{}, false
+	}
+
+	rxBytes, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	rxPackets, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	rxErrors, err := strconv.ParseUint(fields[2], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	rxDropped, err := strconv.ParseUint(fields[3], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+
+	txBytes, err := strconv.ParseUint(fields[8], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	txPackets, err := strconv.ParseUint(fields[9], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	txErrors, err := strconv.ParseUint(fields[10], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+	txDropped, err := strconv.ParseUint(fields[11], 10, 64)
+	if err != nil {
+		return rawNetDev{}, false
+	}
+
+	return rawNetDev{
+		iface:     iface,
+		rxBytes:   rxBytes,
+		rxPackets: rxPackets,
+		rxErrors:  rxErrors,
+		rxDropped: rxDropped,
+		txBytes:   txBytes,
+		txPackets: txPackets,
+		txErrors:  txErrors,
+		txDropped: txDropped,
+	}, true
 }
 
 func getIPs(ifaceName string) (ipv4, ipv6 *string, err error) {
@@ -514,6 +717,7 @@ func (c *NetworkCollector) getIPsWithFallbacks(ifaceName string) (ipv4, ipv6 *st
 	// Method 1: standard net.InterfaceByName
 	ip4, ip6, err := getIPs(ifaceName)
 	if err == nil {
+		c.clearIPIssue(ifaceName)
 		return ip4, ip6
 	}
 	errs = append(errs, fmt.Sprintf("net.InterfaceByName: %v", err))
@@ -521,6 +725,7 @@ func (c *NetworkCollector) getIPsWithFallbacks(ifaceName string) (ipv4, ipv6 *st
 	// Method 2: standard net.Interfaces list search
 	ip4, ip6, err = getIPsFallbackList(ifaceName)
 	if err == nil {
+		c.clearIPIssue(ifaceName)
 		return ip4, ip6
 	}
 	errs = append(errs, fmt.Sprintf("net.Interfaces list: %v", err))
@@ -545,25 +750,31 @@ func (c *NetworkCollector) getIPsWithFallbacks(ifaceName string) (ipv4, ipv6 *st
 	}
 
 	if fallbackIPv4 != nil || fallbackIPv6 != nil {
+		c.clearIPIssue(ifaceName)
 		return fallbackIPv4, fallbackIPv6
 	}
 
-	if c.warnedIPs == nil {
-		c.warnedIPs = make(map[string]bool)
+	level := slog.LevelDebug
+	if c.isConfiguredInterface(ifaceName) {
+		level = slog.LevelWarn
 	}
-	alreadyWarned := c.warnedIPs[ifaceName]
-	c.warnedIPs[ifaceName] = true
-
-	if !alreadyWarned {
-		slog.Warn("failed to retrieve IP addresses for interface",
-			slog.String("component", "collector"),
-			slog.String("collector", "network"),
-			slog.String("interface", ifaceName),
-			slog.String("errors", strings.Join(errs, "; ")),
-		)
-	}
+	c.issueLogger().log(level, c.Name(), actionOmitMetric, "ip_address", ifaceName, fmt.Errorf("%s", strings.Join(errs, "; ")),
+		slog.String("resource_type", resourceTypeInterface),
+		slog.String("resource", ifaceName),
+	)
 
 	return nil, nil
+}
+
+func (c *NetworkCollector) clearIPIssue(ifaceName string) {
+	c.issueLogger().clear(c.Name(), actionOmitMetric, "ip_address", ifaceName,
+		slog.String("resource_type", resourceTypeInterface),
+		slog.String("resource", ifaceName),
+	)
+}
+
+func (c *NetworkCollector) isConfiguredInterface(ifaceName string) bool {
+	return c.config != nil && slices.Contains(c.config.IncludeInterfaces, ifaceName)
 }
 
 func getIPsFallbackList(ifaceName string) (ipv4, ipv6 *string, err error) {

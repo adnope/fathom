@@ -34,11 +34,20 @@ func (s cpuRawState) idleTime() uint64 {
 	return s.idle + s.iowait
 }
 
+type cpuUsageBreakdown struct {
+	usagePercent  float64
+	userPercent   float64
+	sysPercent    float64
+	idlePercent   float64
+	iowaitPercent float64
+	stealPercent  float64
+}
+
 // PerCPUCore represents usage and frequency details of a single logical CPU.
 type PerCPUCore struct {
 	CPU          string   `json:"cpu"`
 	UsagePercent float64  `json:"usage_percent"`
-	FrequencyMHz *float64 `json:"frequency_mhz,omitempty"`
+	FrequencyMHz *float64 `json:"frequency_mhz"`
 }
 
 // CPUCollector monitors CPU usage, core frequencies, load averages, temperature, and power.
@@ -46,21 +55,32 @@ type CPUCollector struct {
 	mu              sync.Mutex
 	procStatPath    string
 	loadavgPath     string
+	procCPUInfoPath string
+	sysCPUPath      string
+	sysHwmonPath    string
+	sysThermalPath  string
+	powercapPath    string
 	prevStates      map[string]cpuRawState
+	prevSampleTime  time.Time
 	prevPowerEnergy uint64
 	prevPowerTime   time.Time
+	now             func() time.Time
 	hasPrev         bool
-	warnedRAPL      bool
-	warnedTemp      bool
-	warnedFreq      bool
+	issues          *collectorIssueLogger
 }
 
 // NewCPUCollector constructs a CPUCollector with default paths.
 func NewCPUCollector() *CPUCollector {
 	return &CPUCollector{
-		procStatPath: "/proc/stat",
-		loadavgPath:  "/proc/loadavg",
-		prevStates:   make(map[string]cpuRawState),
+		procStatPath:    "/proc/stat",
+		loadavgPath:     "/proc/loadavg",
+		procCPUInfoPath: "/proc/cpuinfo",
+		sysCPUPath:      "/sys/devices/system/cpu",
+		sysHwmonPath:    "/sys/class/hwmon",
+		sysThermalPath:  "/sys/class/thermal",
+		powercapPath:    "/sys/class/powercap",
+		prevStates:      make(map[string]cpuRawState),
+		issues:          newCollectorIssueLogger(),
 	}
 }
 
@@ -73,15 +93,22 @@ func (c *CPUCollector) Name() string {
 func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
+	previousSampleTime := c.prevSampleTime
+	sampleStart := c.currentTime()
 	currentStates, err := parseProcStat(c.procStatPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse proc/stat: %w", err)
+		return nil, fmt.Errorf("read required cpu source %s: %w", c.procStatPath, err)
 	}
 
 	if !c.hasPrev {
 		c.prevStates = currentStates
 		c.hasPrev = true
+		c.prevSampleTime = sampleStart
+		previousSampleTime = sampleStart
 
 		select {
 		case <-ctx.Done():
@@ -91,9 +118,11 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 
 		currentStates, err = parseProcStat(c.procStatPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse proc/stat for delta: %w", err)
+			return nil, fmt.Errorf("read required cpu source %s for delta: %w", c.procStatPath, err)
 		}
 	}
+	sampleTime := c.currentTime()
+	sampleInterval := sampleIntervalSeconds(previousSampleTime, sampleTime)
 
 	globalCur, ok := currentStates["cpu"]
 	if !ok {
@@ -103,77 +132,120 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 	if !ok {
 		globalPrev = globalCur
 	}
-
-	deltaTotal := globalCur.total() - globalPrev.total()
-	deltaIdleTime := globalCur.idleTime() - globalPrev.idleTime()
-	deltaActive := deltaTotal - deltaIdleTime
-
-	var usagePercent float64
-	var userPercent float64
-	var sysPercent float64
-	var idlePercent float64
-	var iowaitPercent float64
-	var stealPercent float64
-
-	if deltaTotal > 0 {
-		usagePercent = round((float64(deltaActive)/float64(deltaTotal))*100, 2)
-		userPercent = round((float64((globalCur.user-globalPrev.user)+(globalCur.nice-globalPrev.nice))/float64(deltaTotal))*100, 2)
-		sysPercent = round((float64((globalCur.system-globalPrev.system)+(globalCur.irq-globalPrev.irq)+(globalCur.softirq-globalPrev.softirq))/float64(deltaTotal))*100, 2)
-		idlePercent = round((float64(globalCur.idle-globalPrev.idle)/float64(deltaTotal))*100, 2)
-		iowaitPercent = round((float64(globalCur.iowait-globalPrev.iowait)/float64(deltaTotal))*100, 2)
-		stealPercent = round((float64(globalCur.steal-globalPrev.steal)/float64(deltaTotal))*100, 2)
-	}
-
-	l1, l5, l15, _ := getLoadAverages(c.loadavgPath)
-	freqs := c.getCPUFrequencies()
-
-	var freqSum float64
-	freqMin := math.MaxFloat64
-	freqMax := 0.0
-	for _, f := range freqs {
-		freqSum += f
-		if f < freqMin {
-			freqMin = f
-		}
-		if f > freqMax {
-			freqMax = f
-		}
-	}
-	var freqAvg float64
-	if len(freqs) > 0 {
-		freqAvg = round(freqSum/float64(len(freqs)), 2)
-		freqMin = round(freqMin, 2)
-		freqMax = round(freqMax, 2)
+	if globalCur.total() < globalPrev.total() || globalCur.idleTime() < globalPrev.idleTime() {
+		c.issueLogger().log(slog.LevelDebug, c.Name(), actionZeroMetric, "cpu_usage_percent", c.procStatPath, nil)
 	} else {
-		freqMin = 0.0
+		c.issueLogger().clear(c.Name(), actionZeroMetric, "cpu_usage_percent", c.procStatPath)
 	}
+
+	usage := calculateCPUUsage(globalCur, globalPrev)
+
+	l1, l5, l15, loadOk := c.loadAverages()
+	freqs := c.getCPUFrequencies()
+	freqAvg, freqMin, freqMax, hasFreqs := summarizeCPUFrequencies(freqs)
 
 	tempAvg, tempMax, tempOk := c.getCPUTemperatures()
 	power := c.getPowerWatts()
+	perCPUMetrics := buildPerCPUMetrics(currentStates, c.prevStates, freqs)
 
-	var perCPUMetrics []PerCPUCore
+	c.prevStates = currentStates
+	c.prevSampleTime = sampleTime
+	data := buildCPUMetricData(usage, l1, l5, l15, loadOk, perCPUMetrics, freqAvg, freqMin, freqMax, hasFreqs, tempAvg, tempMax, tempOk, power, sampleInterval)
+
+	return []Event{
+		{
+			Event:     eventMetricSample,
+			Collector: c.Name(),
+			Component: componentCollector,
+			Data:      data,
+		},
+	}, nil
+}
+
+func (c *CPUCollector) issueLogger() *collectorIssueLogger {
+	if c.issues == nil {
+		c.issues = newCollectorIssueLogger()
+	}
+	return c.issues
+}
+
+func (c *CPUCollector) currentTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func calculateCPUUsage(cur, prev cpuRawState) cpuUsageBreakdown {
+	deltaTotal, ok := nonNegativeDelta(cur.total(), prev.total())
+	if !ok {
+		return cpuUsageBreakdown{}
+	}
+	deltaIdleTime, ok := nonNegativeDelta(cur.idleTime(), prev.idleTime())
+	if !ok || deltaIdleTime > deltaTotal {
+		return cpuUsageBreakdown{}
+	}
+	deltaActive := deltaTotal - deltaIdleTime
+
+	var usage cpuUsageBreakdown
+	if deltaTotal > 0 {
+		usage.usagePercent = round((float64(deltaActive)/float64(deltaTotal))*100, 2)
+		usage.userPercent = round((float64(safeCPUCounterDelta(cur.user, prev.user)+safeCPUCounterDelta(cur.nice, prev.nice))/float64(deltaTotal))*100, 2)
+		usage.sysPercent = round((float64(safeCPUCounterDelta(cur.system, prev.system)+safeCPUCounterDelta(cur.irq, prev.irq)+safeCPUCounterDelta(cur.softirq, prev.softirq))/float64(deltaTotal))*100, 2)
+		usage.idlePercent = round((float64(safeCPUCounterDelta(cur.idle, prev.idle))/float64(deltaTotal))*100, 2)
+		usage.iowaitPercent = round((float64(safeCPUCounterDelta(cur.iowait, prev.iowait))/float64(deltaTotal))*100, 2)
+		usage.stealPercent = round((float64(safeCPUCounterDelta(cur.steal, prev.steal))/float64(deltaTotal))*100, 2)
+	}
+
+	return usage
+}
+
+func safeCPUCounterDelta(curr, prev uint64) uint64 {
+	delta, ok := nonNegativeDelta(curr, prev)
+	if !ok {
+		return 0
+	}
+	return delta
+}
+
+func summarizeCPUFrequencies(freqs map[string]float64) (avg, min, max float64, ok bool) {
+	if len(freqs) == 0 {
+		return 0, 0, 0, false
+	}
+
+	min = math.MaxFloat64
+	for _, freq := range freqs {
+		avg += freq
+		if freq < min {
+			min = freq
+		}
+		if freq > max {
+			max = freq
+		}
+	}
+
+	return round(avg/float64(len(freqs)), 2), round(min, 2), round(max, 2), true
+}
+
+func buildPerCPUMetrics(currentStates, prevStates map[string]cpuRawState, freqs map[string]float64) []PerCPUCore {
+	perCPUMetrics := make([]PerCPUCore, 0, len(currentStates))
 	for name, cur := range currentStates {
 		if name == "cpu" {
 			continue
 		}
-		prev, ok := c.prevStates[name]
+
+		prev, ok := prevStates[name]
 		if !ok {
 			prev = cur
-		}
-		dTotal := cur.total() - prev.total()
-		dIdleTime := cur.idleTime() - prev.idleTime()
-		var cpuUsage float64
-		if dTotal > 0 {
-			cpuUsage = round((float64(dTotal-dIdleTime)/float64(dTotal))*100, 2)
 		}
 
 		cpuInfo := PerCPUCore{
 			CPU:          name,
-			UsagePercent: cpuUsage,
+			UsagePercent: calculateCPUUsage(cur, prev).usagePercent,
 		}
 		if freq, found := freqs[name]; found {
-			fVal := round(freq, 2)
-			cpuInfo.FrequencyMHz = &fVal
+			freqMHz := round(freq, 2)
+			cpuInfo.FrequencyMHz = &freqMHz
 		}
 		perCPUMetrics = append(perCPUMetrics, cpuInfo)
 	}
@@ -184,50 +256,72 @@ func (c *CPUCollector) Collect(ctx context.Context) ([]Event, error) {
 		return idxI < idxJ
 	})
 
-	c.prevStates = currentStates
+	return perCPUMetrics
+}
 
+func buildCPUMetricData(usage cpuUsageBreakdown, l1, l5, l15 float64, loadOk bool, perCPUMetrics []PerCPUCore, freqAvg, freqMin, freqMax float64, hasFreqs bool, tempAvg, tempMax float64, tempOk bool, power float64, sampleIntervalSeconds any) map[string]any {
 	numCPUs := float64(len(perCPUMetrics))
 	if numCPUs == 0 {
 		numCPUs = 1
 	}
 
 	data := map[string]any{
-		"usage_percent":       usagePercent,
-		"user_percent":        userPercent,
-		"system_percent":      sysPercent,
-		"idle_percent":        idlePercent,
-		"iowait_percent":      iowaitPercent,
-		"steal_percent":       stealPercent,
-		"load_average_1m":     round(l1, 2),
-		"load_average_5m":     round(l5, 2),
-		"load_average_15m":    round(l15, 2),
-		"normalized_load_1m":  round(l1/numCPUs, 2),
-		"normalized_load_5m":  round(l5/numCPUs, 2),
-		"normalized_load_15m": round(l15/numCPUs, 2),
-		"per_cpu":             perCPUMetrics,
+		"sample_interval_seconds":     sampleIntervalSeconds,
+		"cpu_usage_percent":           usage.usagePercent,
+		"cpu_user_percent":            usage.userPercent,
+		"cpu_system_percent":          usage.sysPercent,
+		"cpu_idle_percent":            usage.idlePercent,
+		"cpu_iowait_percent":          usage.iowaitPercent,
+		"cpu_steal_percent":           usage.stealPercent,
+		"cpu_load_average_1m":         nil,
+		"cpu_load_average_5m":         nil,
+		"cpu_load_average_15m":        nil,
+		"cpu_normalized_load_1m":      nil,
+		"cpu_normalized_load_5m":      nil,
+		"cpu_normalized_load_15m":     nil,
+		"cpu_frequency_mhz_avg":       nil,
+		"cpu_frequency_mhz_min":       nil,
+		"cpu_frequency_mhz_max":       nil,
+		"cpu_temperature_celsius_avg": nil,
+		"cpu_temperature_celsius_max": nil,
+		"cpu_power_watts":             nil,
+		"per_cpu":                     perCPUMetrics,
 	}
 
-	if len(freqs) > 0 {
-		data["frequency_mhz_avg"] = freqAvg
-		data["frequency_mhz_min"] = freqMin
-		data["frequency_mhz_max"] = freqMax
+	if loadOk {
+		data["cpu_load_average_1m"] = round(l1, 2)
+		data["cpu_load_average_5m"] = round(l5, 2)
+		data["cpu_load_average_15m"] = round(l15, 2)
+		data["cpu_normalized_load_1m"] = round(l1/numCPUs, 2)
+		data["cpu_normalized_load_5m"] = round(l5/numCPUs, 2)
+		data["cpu_normalized_load_15m"] = round(l15/numCPUs, 2)
+	}
+
+	if hasFreqs {
+		data["cpu_frequency_mhz_avg"] = freqAvg
+		data["cpu_frequency_mhz_min"] = freqMin
+		data["cpu_frequency_mhz_max"] = freqMax
 	}
 	if tempOk {
-		data["temperature_celsius_avg"] = round(tempAvg, 1)
-		data["temperature_celsius_max"] = round(tempMax, 1)
+		data["cpu_temperature_celsius_avg"] = round(tempAvg, 1)
+		data["cpu_temperature_celsius_max"] = round(tempMax, 1)
 	}
 	if power > 0 {
-		data["power_watts"] = round(power, 2)
+		data["cpu_power_watts"] = round(power, 2)
 	}
 
-	return []Event{
-		{
-			Event:     "metric_sample",
-			Collector: "cpu",
-			Component: "collector",
-			Data:      data,
-		},
-	}, nil
+	return data
+}
+
+func sampleIntervalSeconds(previous, current time.Time) any {
+	if previous.IsZero() {
+		return nil
+	}
+	duration := current.Sub(previous).Seconds()
+	if duration <= 0 {
+		return nil
+	}
+	return round(duration, 3)
 }
 
 func parseProcStat(path string) (map[string]cpuRawState, error) {
@@ -252,12 +346,20 @@ func parseProcStat(path string) (map[string]cpuRawState, error) {
 			}
 
 			var vals [8]uint64
+			validLine := true
 			for i := range 8 {
 				v, err := strconv.ParseUint(fields[i+1], 10, 64)
 				if err != nil {
-					return nil, err
+					if name == "cpu" {
+						return nil, fmt.Errorf("parse aggregate cpu field %d: %w", i+1, err)
+					}
+					validLine = false
+					break
 				}
 				vals[i] = v
+			}
+			if !validLine {
+				continue
 			}
 
 			states[name] = cpuRawState{
@@ -272,13 +374,27 @@ func parseProcStat(path string) (map[string]cpuRawState, error) {
 			}
 		}
 	}
-	return states, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if _, ok := states["cpu"]; !ok {
+		return nil, fmt.Errorf("missing aggregate cpu line")
+	}
+	return states, nil
 }
 
 func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 	freqs := make(map[string]float64)
+	sysCPUPath := c.sysCPUPath
+	if sysCPUPath == "" {
+		sysCPUPath = "/sys/devices/system/cpu"
+	}
+	procCPUInfoPath := c.procCPUInfoPath
+	if procCPUInfoPath == "" {
+		procCPUInfoPath = "/proc/cpuinfo"
+	}
 
-	matches, err := filepath.Glob("/sys/devices/system/cpu/cpu[0-9]*")
+	matches, err := filepath.Glob(filepath.Join(sysCPUPath, "cpu[0-9]*"))
 	if err == nil && len(matches) > 0 {
 		for _, m := range matches {
 			cpuName := filepath.Base(m)
@@ -299,7 +415,7 @@ func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 	}
 
 	if len(freqs) == 0 {
-		policies, err := filepath.Glob("/sys/devices/system/cpu/cpufreq/policy*")
+		policies, err := filepath.Glob(filepath.Join(sysCPUPath, "cpufreq/policy*"))
 		if err == nil && len(policies) > 0 {
 			for _, p := range policies {
 				affectedData, err := os.ReadFile(filepath.Join(p, "affected_cpus"))
@@ -330,7 +446,7 @@ func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 	}
 
 	if len(freqs) == 0 {
-		if file, err := os.Open("/proc/cpuinfo"); err == nil {
+		if file, err := os.Open(procCPUInfoPath); err == nil {
 			defer file.Close()
 			scanner := bufio.NewScanner(file)
 			cpuIdx := 0
@@ -351,13 +467,9 @@ func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 	}
 
 	if len(freqs) == 0 {
-		if !c.warnedFreq {
-			slog.Warn("unable to read CPU frequency metrics",
-				slog.String("component", "collector"),
-				slog.String("collector", "cpu"),
-			)
-			c.warnedFreq = true
-		}
+		c.issueLogger().log(slog.LevelDebug, c.Name(), actionOmitMetric, metricFrequencyMHz, sysCPUPath, nil)
+	} else {
+		c.issueLogger().clear(c.Name(), actionOmitMetric, metricFrequencyMHz, sysCPUPath)
 	}
 
 	return freqs
@@ -365,8 +477,16 @@ func (c *CPUCollector) getCPUFrequencies() map[string]float64 {
 
 func (c *CPUCollector) getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 	var temps []float64
+	sysHwmonPath := c.sysHwmonPath
+	if sysHwmonPath == "" {
+		sysHwmonPath = "/sys/class/hwmon"
+	}
+	sysThermalPath := c.sysThermalPath
+	if sysThermalPath == "" {
+		sysThermalPath = "/sys/class/thermal"
+	}
 
-	matches, err := filepath.Glob("/sys/class/hwmon/hwmon*/name")
+	matches, err := filepath.Glob(filepath.Join(sysHwmonPath, "hwmon*/name"))
 	if err == nil && len(matches) > 0 {
 		for _, m := range matches {
 			if nameData, err := os.ReadFile(m); err == nil {
@@ -389,7 +509,7 @@ func (c *CPUCollector) getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 	}
 
 	if len(temps) == 0 {
-		matches, err := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
+		matches, err := filepath.Glob(filepath.Join(sysThermalPath, "thermal_zone*/temp"))
 		if err == nil {
 			for _, m := range matches {
 				dir := filepath.Dir(m)
@@ -418,15 +538,10 @@ func (c *CPUCollector) getCPUTemperatures() (avgVal, maxVal float64, ok bool) {
 	}
 
 	if len(temps) == 0 {
-		if !c.warnedTemp {
-			slog.Warn("no compatible hardware temperature sensors found",
-				slog.String("component", "collector"),
-				slog.String("collector", "cpu"),
-			)
-			c.warnedTemp = true
-		}
+		c.issueLogger().log(slog.LevelDebug, c.Name(), actionOmitMetric, metricTemperatureCelsius, sysHwmonPath, nil)
 		return 0.0, 0.0, false
 	}
+	c.issueLogger().clear(c.Name(), actionOmitMetric, metricTemperatureCelsius, sysHwmonPath)
 
 	var sum float64
 	maxVal = -1000.0
@@ -488,8 +603,22 @@ func getLoadAverages(path string) (l1, l5, l15 float64, err error) {
 	return l1, l5, l15, nil
 }
 
+func (c *CPUCollector) loadAverages() (l1, l5, l15 float64, ok bool) {
+	l1, l5, l15, err := getLoadAverages(c.loadavgPath)
+	if err != nil {
+		c.issueLogger().log(slog.LevelDebug, c.Name(), actionOmitMetric, "cpu_load_average", c.loadavgPath, err)
+		return 0, 0, 0, false
+	}
+	c.issueLogger().clear(c.Name(), actionOmitMetric, "cpu_load_average", c.loadavgPath)
+	return l1, l5, l15, true
+}
+
 func (c *CPUCollector) getPowerWatts() float64 {
-	raplPaths, _ := filepath.Glob("/sys/class/powercap/intel-rapl:[0-9]*/energy_uj")
+	powercapPath := c.powercapPath
+	if powercapPath == "" {
+		powercapPath = "/sys/class/powercap"
+	}
+	raplPaths, _ := filepath.Glob(filepath.Join(powercapPath, "intel-rapl:[0-9]*/energy_uj"))
 	var totalEnergy uint64
 	for _, p := range raplPaths {
 		if data, err := os.ReadFile(p); err == nil {
@@ -504,37 +633,43 @@ func (c *CPUCollector) getPowerWatts() float64 {
 		if c.prevPowerEnergy == 0 {
 			c.prevPowerEnergy = totalEnergy
 			c.prevPowerTime = now
+			c.issueLogger().clear(c.Name(), actionOmitMetric, metricPowerWatts, powercapPath)
 			return 0.0
 		}
 
-		deltaEnergy := totalEnergy - c.prevPowerEnergy
+		deltaEnergy, ok := nonNegativeDelta(totalEnergy, c.prevPowerEnergy)
 		deltaTime := now.Sub(c.prevPowerTime)
 
 		c.prevPowerEnergy = totalEnergy
 		c.prevPowerTime = now
 
+		if !ok {
+			c.issueLogger().log(slog.LevelDebug, c.Name(), actionZeroMetric, metricPowerWatts, powercapPath, nil)
+			return 0.0
+		}
 		if deltaTime.Seconds() > 0 {
+			c.issueLogger().clear(c.Name(), actionOmitMetric, metricPowerWatts, powercapPath)
+			c.issueLogger().clear(c.Name(), actionZeroMetric, metricPowerWatts, powercapPath)
 			return float64(deltaEnergy) / 1000000.0 / deltaTime.Seconds()
 		}
 		return 0.0
 	}
 
 	if hwmonPower := c.getHwmonPower(); hwmonPower > 0 {
+		c.issueLogger().clear(c.Name(), actionOmitMetric, metricPowerWatts, powercapPath)
 		return hwmonPower
 	}
 
-	if !c.warnedRAPL {
-		slog.Debug("failed to retrieve CPU power metrics",
-			slog.String("component", "collector"),
-			slog.String("collector", "cpu"),
-		)
-		c.warnedRAPL = true
-	}
+	c.issueLogger().log(slog.LevelDebug, c.Name(), actionOmitMetric, metricPowerWatts, powercapPath, nil)
 	return 0.0
 }
 
 func (c *CPUCollector) getHwmonPower() float64 {
-	matches, err := filepath.Glob("/sys/class/hwmon/hwmon*/name")
+	sysHwmonPath := c.sysHwmonPath
+	if sysHwmonPath == "" {
+		sysHwmonPath = "/sys/class/hwmon"
+	}
+	matches, err := filepath.Glob(filepath.Join(sysHwmonPath, "hwmon*/name"))
 	if err != nil || len(matches) == 0 {
 		return 0.0
 	}

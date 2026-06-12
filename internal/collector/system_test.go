@@ -50,11 +50,15 @@ procs_blocked 2
 		t.Fatalf("failed to create mock self task: %v", err)
 	}
 
+	sampleTime := time.Unix(1000, 0)
 	c := &SystemCollector{
 		procStatPath: statPath,
 		uptimePath:   uptimePath,
 		fileNrPath:   fileNrPath,
 		procDir:      procDir,
+		now: func() time.Time {
+			return sampleTime
+		},
 	}
 
 	events, err := c.Collect(context.Background())
@@ -72,6 +76,7 @@ procs_blocked 2
 	}
 
 	expectedMetrics := map[string]any{
+		"sample_interval_seconds":              nil,
 		"system_uptime_seconds":                12345.67,
 		"system_processes_running":             uint64(5),
 		"system_processes_blocked":             uint64(2),
@@ -81,8 +86,8 @@ procs_blocked 2
 		"system_file_descriptors_max":          uint64(1000000),
 		"system_file_descriptors_used_percent": 1.0,
 		"system_threads_total":                 uint64(3),
-		"system_context_switches_per_second":   0.0,
-		"system_processes_created_per_second":  0.0,
+		"system_context_switches_per_second":   nil,
+		"system_processes_created_per_second":  nil,
 	}
 
 	for k, expectedVal := range expectedMetrics {
@@ -107,8 +112,7 @@ procs_blocked 1
 		t.Fatalf("failed to write mock stat 2: %v", err)
 	}
 
-	// Artificially adjust c.prevTime to simulate 2-second interval
-	c.prevTime = time.Now().Add(-2 * time.Second)
+	sampleTime = sampleTime.Add(2 * time.Second)
 
 	events, err = c.Collect(context.Background())
 	if err != nil {
@@ -116,6 +120,9 @@ procs_blocked 1
 	}
 
 	ev = events[0]
+	if ev.Data["sample_interval_seconds"] != 2.0 {
+		t.Errorf("expected sample interval 2.0, got %v", ev.Data["sample_interval_seconds"])
+	}
 	// ctxt diff: 9876743 - 9876543 = 200 ctxt / 2s = 100.0 ctxt/sec
 	// processes diff: 4577 - 4567 = 10 proc / 2s = 5.0 proc/sec
 	if ev.Data["system_context_switches_per_second"] != 100.0 {
@@ -123,5 +130,27 @@ procs_blocked 1
 	}
 	if ev.Data["system_processes_created_per_second"] != 5.0 {
 		t.Errorf("expected processes rate 5.0, got %v", ev.Data["system_processes_created_per_second"])
+	}
+}
+
+func TestSystemCollectorUpdateRatesCounterReset(t *testing.T) {
+	prevTime := time.Unix(1000, 0)
+	c := &SystemCollector{
+		prevCtxt:      100,
+		prevProcesses: 50,
+		prevTime:      prevTime,
+		hasPrev:       true,
+	}
+
+	rates := c.updateSystemRates(90, 40, prevTime.Add(time.Second))
+
+	if !rates.hasSampleInterval || rates.sampleIntervalSeconds != 1 {
+		t.Fatalf("expected sample interval after counter reset, got %+v", rates)
+	}
+	if rates.ctxtRate != 0 || rates.processesRate != 0 {
+		t.Fatalf("expected zero rates after counter reset, got %+v", rates)
+	}
+	if c.prevCtxt != 90 || c.prevProcesses != 40 {
+		t.Fatalf("expected previous counters to update after reset, got ctxt=%d processes=%d", c.prevCtxt, c.prevProcesses)
 	}
 }

@@ -1,4 +1,4 @@
-.PHONY: all build run test clean fmt
+.PHONY: all build run test clean fmt fix
 
 BINARY_NAME=fathom
 
@@ -15,6 +15,10 @@ test:
 
 fmt:
 	go fmt ./...
+
+fix: fmt
+	go vet ./...
+	go test ./...
 
 clean:
 	rm -f bin/$(BINARY_NAME)
